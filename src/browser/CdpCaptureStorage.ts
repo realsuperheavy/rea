@@ -1,7 +1,6 @@
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
+import type { BrowserExclusionReason } from "../domain/browserCompleteness.js";
 import { CdpConnection } from "./CdpConnection.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
 import {
@@ -13,10 +12,10 @@ import {
   numberValue,
   recordValue,
   recordsValue,
-  stringValue,
+  cdpStringValue,
 } from "./CdpCaptureValues.js";
 
-/** Capture redacted storage metadata for one authorized origin. */
+/** Capture redacted storage metadata for an authorized page and its origin. */
 export const captureStorage = async (
   context: {
     readonly connection: CdpConnection;
@@ -24,11 +23,13 @@ export const captureStorage = async (
     readonly input: InspectWebPageInput;
     readonly signal?: AbortSignal;
   },
-  origin: string,
+  pageUrl: string,
   limitations: string[],
 ): Promise<{
   readonly value: WebPageInspection["storage"];
+  readonly keysExclusion: BrowserExclusionReason | undefined;
 }> => {
+  const origin = new URL(pageUrl).origin;
   const quota = recordValue(
     await optionalCdpCommand(
       context,
@@ -61,12 +62,13 @@ export const captureStorage = async (
         limitations,
       )
     : undefined;
-  const cacheValues = recordsValue(recordValue(cacheRaw)?.caches);
-  const caches = capturedCaches(cacheValues);
+  const cacheField = recordValue(cacheRaw)?.caches;
+  const caches = capturedCaches(recordsValue(cacheField));
   const fingerprints = context.input.include_storage_fingerprints
     ? await captureStorageFingerprints({
         context,
         origin,
+        cookieUrl: pageUrl,
         local,
         session,
         indexedDbNames: indexed,
@@ -78,9 +80,22 @@ export const captureStorage = async (
     indexedRaw !== undefined &&
     Array.isArray(indexedValues) &&
     indexed.length === indexedValues.length &&
-    cacheRaw !== undefined &&
-    caches.length === cacheValues.length;
+    // Like IndexedDB names, a missing, non-array or partly unusable cache
+    // list is an incomplete enumeration rather than an empty one.
+    Array.isArray(cacheField) &&
+    caches.length === cacheField.length;
+  const keysExclusion = !context.input.include_storage_keys
+    ? undefined
+    : local.exclusion === "provider_unavailable" ||
+        session.exclusion === "provider_unavailable" ||
+        indexedRaw === undefined ||
+        cacheRaw === undefined
+      ? "provider_unavailable"
+      : !local.complete || !session.complete || !structuredStorageComplete
+        ? "invalid_protocol_value"
+        : undefined;
   return {
+    keysExclusion,
     value: {
       origin,
       usage_bytes: numberValue(quota?.usage) ?? null,
@@ -97,7 +112,11 @@ export const captureStorage = async (
   };
 };
 
-const emptyStorageItems: CapturedStorageItems = {
+type StorageItemsCapture = CapturedStorageItems & {
+  readonly exclusion?: "provider_unavailable" | "invalid_protocol_value";
+};
+
+const emptyStorageItems: StorageItemsCapture = {
   items: [],
   complete: false,
 };
@@ -106,8 +125,8 @@ const capturedCaches = (
   values: readonly Record<string, unknown>[],
 ): CapturedCache[] =>
   values.flatMap((cache) => {
-    const name = stringValue(cache.cacheName);
-    const id = stringValue(cache.cacheId);
+    const name = cdpStringValue(cache.cacheName);
+    const id = cdpStringValue(cache.cacheId);
     return name === undefined || id === undefined ? [] : [{ name, id }];
   });
 
@@ -116,7 +135,7 @@ const storageItems = async (
   origin: string,
   isLocalStorage: boolean,
   limitations: string[],
-): Promise<CapturedStorageItems> => {
+): Promise<StorageItemsCapture> => {
   const raw = await optionalCdpCommand(
     context,
     "DOMStorage.getDOMStorageItems",
@@ -125,11 +144,16 @@ const storageItems = async (
   );
   const entries = recordValue(raw)?.entries;
   if (raw === undefined || !Array.isArray(entries))
-    return { items: [], complete: false };
+    return {
+      items: [],
+      complete: false,
+      exclusion:
+        raw === undefined ? "provider_unavailable" : "invalid_protocol_value",
+    };
   const items = entries.flatMap((entry) => {
     if (!Array.isArray(entry)) return [];
-    const key = stringValue(entry[0]);
-    const value = stringValue(entry[1]);
+    const key = cdpStringValue(entry[0]);
+    const value = cdpStringValue(entry[1]);
     return key === undefined || value === undefined ? [] : [{ key, value }];
   });
   return { items, complete: items.length === entries.length };
@@ -138,7 +162,7 @@ const storageItems = async (
 const stringArray = (value: unknown): readonly string[] =>
   Array.isArray(value)
     ? value.flatMap((item) => {
-        const text = stringValue(item);
+        const text = cdpStringValue(item);
         return text === undefined ? [] : [text];
       })
     : [];

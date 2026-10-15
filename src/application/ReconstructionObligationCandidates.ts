@@ -7,17 +7,18 @@ import {
   parseEvidenceBundle,
   type EvidenceBundle,
 } from "../domain/evidenceBundle.js";
-import { parseProcessCapture } from "../domain/processCapture.js";
+import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
 import type {
   ReconstructionObligation,
   ReviewedReconstructionObligation,
 } from "../domain/reconstructionObligationLedgerSchemas.js";
-import { parseApplicationGraphEvidence } from "./JavaScriptApplicationEvidenceGraph.js";
+import { parseApplicationGraphEvidence } from "./javascript/JavaScriptApplicationEvidenceGraph.js";
 import {
   applicationObligationPolicy,
   semanticObligationPolicy,
   type ReconstructionObligationCandidatePolicy,
 } from "./ReconstructionObligationPolicies.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 type CandidateFields = Omit<
   ReconstructionObligation,
@@ -54,7 +55,7 @@ export const deriveReconstructionObligationCandidates = (
     addCandidate(candidates, reviewedCandidate(obligation, records));
   return {
     candidates: [...candidates.values()].sort((left, right) =>
-      left.obligation_id.localeCompare(right.obligation_id),
+      compareUnicodeCodePoints(left.obligation_id, right.obligation_id),
     ),
     limitations: [...limitations].sort(),
   };
@@ -75,10 +76,23 @@ const deriveApplicationCandidates = (
   )
     return;
   try {
-    const source = parseApplicationGraphEvidence(evidence);
+    const parsed = parseApplicationGraphEvidence(evidence);
+    if (!parsed.ok) {
+      limitations.add(
+        `Application Evidence ${evidence.evidence_id} could not generate candidates because it failed graph validation.`,
+      );
+      return;
+    }
+    const source = parsed.value;
     for (const node of source.graph.nodes) {
       const candidatePolicy = applicationObligationPolicy(node.kind);
-      if (candidatePolicy === undefined) continue;
+      if (candidatePolicy === undefined) {
+        if (node.kind === "unknown")
+          limitations.add(
+            `Application graph ${source.graph.graph_id} contains unresolved node ${node.node_id}; reconstruction obligations remain unknown.`,
+          );
+        continue;
+      }
       const reference = node.observations.map((observation) =>
         graphReference(
           evidence,
@@ -101,10 +115,21 @@ const deriveApplicationCandidates = (
         }),
       );
     }
-    if (source.semanticGraph !== null)
+    if (source.semanticGraph !== null) {
+      const evidenceContexts = new Map(
+        source.semanticGraph.evidence_contexts.map((context) => [
+          context.context_id,
+          context,
+        ]),
+      );
       for (const node of source.semanticGraph.nodes) {
         const candidatePolicy = semanticObligationPolicy(node.kind);
         if (candidatePolicy === undefined) continue;
+        const evidenceContext = evidenceContexts.get(node.evidence.context_id);
+        if (evidenceContext === undefined)
+          throw new TypeError(
+            "Semantic evidence reference names an absent context",
+          );
         addCandidate(
           candidates,
           generatedCandidate({
@@ -119,13 +144,14 @@ const deriveApplicationCandidates = (
               graphReference(
                 evidence,
                 records,
-                node.evidence,
+                evidenceContext,
                 `${source.semanticGraph.graph_id}/node/${node.node_id}`,
               ),
             ],
           }),
         );
       }
+    }
     if (source.graph.coverage.status !== "complete")
       limitations.add(
         `Application graph ${source.graph.graph_id} coverage is ${source.graph.coverage.status}; omitted candidates remain unknown.`,
@@ -170,6 +196,12 @@ const deriveProcessCandidate = (
           ]
         : []),
     ];
+    if (capture.manifest.executable_sha256 === null) {
+      limitations.add(
+        `Process capture ${evidence.evidence_id} has no validated executable artifact identity; packaged-process lifecycle obligation was not bound to an artifact.`,
+      );
+      return;
+    }
     addCandidate(candidates, {
       obligation_id: obligationId(
         `process:${capture.manifest.executable_sha256}:${capture.manifest.full_scenario_sha256}`,
@@ -381,7 +413,22 @@ const addCandidate = (
       ...current.authority_references,
       ...candidate.authority_references,
     ]),
-    definitionCount: current.definitionCount + candidate.definitionCount,
+    // Each observation keeps its own unresolved authority and next steps.
+    unavailable_authority: uniqueBy(
+      [...current.unavailable_authority, ...candidate.unavailable_authority],
+      (item) => item,
+    ),
+    required_next_evidence: uniqueBy(
+      [...current.required_next_evidence, ...candidate.required_next_evidence],
+      (item) => item,
+    ),
+    // A generated ID digests its derivation key, so two generated candidates
+    // with one ID are the same claim seen by several records. Only another
+    // reviewed definition can introduce a competing definition.
+    definitionCount:
+      current.origin === "generated" && candidate.origin === "generated"
+        ? current.definitionCount
+        : current.definitionCount + candidate.definitionCount,
   });
 };
 
@@ -399,7 +446,7 @@ const uniqueBy = <Value>(
   key: (value: Value) => string,
 ): Value[] =>
   [...new Map(values.map((value) => [key(value), value])).values()].sort(
-    (left, right) => key(left).localeCompare(key(right)),
+    (left, right) => compareUnicodeCodePoints(key(left), key(right)),
   );
 
 const obligationId = (key: string): string =>

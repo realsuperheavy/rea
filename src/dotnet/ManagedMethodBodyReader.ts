@@ -1,10 +1,16 @@
+import {
+  admitManagedProjection,
+  type ManagedDecodeBudget,
+} from "./ManagedDecodeBudget.js";
 import type { ManagedPeLayout } from "./ManagedPeReader.js";
 import type { ManagedMethodBody } from "./ManagedMemberInspectorCore.js";
 import {
   decodeInstructions,
   parseExceptionRegions,
 } from "./ManagedMemberInstructionDecoder.js";
+import { validateExceptionRegionRanges } from "./ManagedExceptionRegionValidation.js";
 import { sha256Bytes } from "./ManagedMetadataHeaps.js";
+import { ManagedReaderFailure } from "./ManagedReaderFailure.js";
 
 const bodyStatus = (
   decodedIssue: string | null,
@@ -69,25 +75,48 @@ export const methodBody = (
     implFlags: 0,
     flags: 0,
   },
-): ManagedMethodBody => {
-  if (rva === 0) return emptyMethodBody(rva, "absent", null);
-  if (
+  budget?: ManagedDecodeBudget,
+): {
+  readonly body: ManagedMethodBody;
+  /**
+   * Whether every CIL instruction was decoded, independent of exception-region
+   * validity. A body with no CIL, absent or native, has nothing left unscanned.
+   */
+  readonly scanned: boolean;
+} => {
+  // Without CIL there is nothing left unscanned.
+  if (rva === 0)
+    return { body: emptyMethodBody(rva, "absent", null), scanned: true };
+  const native =
     (implementation.implFlags & 7) !== 0 ||
-    (implementation.flags & 0x2000) !== 0
-  )
-    return emptyMethodBody(
-      rva,
-      "partial",
-      "CIL decoding is unavailable for native, runtime, unmanaged, or P/Invoke implementations",
-    );
+    (implementation.flags & 0x2000) !== 0;
+  if (native) {
+    const issue =
+      "CIL decoding is unavailable for native, runtime, unmanaged, or P/Invoke implementations";
+    return { body: emptyMethodBody(rva, "partial", issue), scanned: true };
+  }
   try {
     const offset = pe.rvaToOffset(rva, 1, "method.body");
+    const methodExtent = pe.rvaAvailableBytes(rva, "method.body");
     const header = readMethodBodyHeader(bytes, offset);
+    if (
+      header.size > methodExtent ||
+      header.ilSize > methodExtent - header.size
+    )
+      throw new RangeError("Method body leaves file-backed PE section data");
     const ilOffset = offset + header.size;
     if (ilOffset > bytes.length - header.ilSize)
       throw new RangeError("Method IL bytes leave artifact");
     const il = bytes.subarray(ilOffset, ilOffset + header.ilSize);
-    const decoded = decodeInstructions(il);
+    // Bound the actual instruction records before allocating them. One raw
+    // byte is only an upper bound on count; wide operands do not create a
+    // separate instruction for every byte. Retained output is charged below.
+    const decoded = decodeInstructions(
+      il,
+      budget === undefined
+        ? undefined
+        : (start) => budget.admitTransient(256, ilOffset + start),
+    );
     const opcodeCounts: Record<string, number> = {};
     for (const instruction of decoded.parsed)
       opcodeCounts[instruction.opcode] =
@@ -111,17 +140,26 @@ export const methodBody = (
       "utf8",
     );
     const methodEnd = ilOffset + header.ilSize;
-    const sectionOffset = (methodEnd + 3) & ~3;
+    const sectionOffset = Math.ceil(methodEnd / 4) * 4;
     const exceptionRegions =
       header.format === "fat" && (header.flags & 8) !== 0
-        ? parseExceptionRegions(bytes, sectionOffset, bytes.length)
+        ? validateExceptionRegionRanges(
+            parseExceptionRegions(
+              bytes,
+              sectionOffset,
+              offset + methodExtent,
+              budget,
+            ),
+            header.ilSize,
+            decoded.instructionStarts,
+          )
         : null;
     const status = bodyStatus(
       decoded.issue,
       decoded.truncated,
       exceptionRegions,
     );
-    return {
+    const body: ManagedMethodBody = {
       status,
       header_format: header.format,
       rva,
@@ -151,12 +189,32 @@ export const methodBody = (
           ? "Instruction decoding stopped before the end of the method body"
           : null),
     };
+    return {
+      body: budget === undefined ? body : admitManagedProjection(body, budget),
+      scanned: decoded.issue === null && decoded.truncated === 0,
+    };
   } catch (cause: unknown) {
-    return emptyMethodBody(
-      rva,
-      "malformed",
-      cause instanceof Error ? cause.message : "Method body parse failed",
-    );
+    if (
+      cause instanceof ManagedReaderFailure &&
+      cause.issue.code === "resource-limit"
+    )
+      throw cause;
+    if (
+      !(cause instanceof ManagedReaderFailure) &&
+      !(cause instanceof RangeError)
+    )
+      throw cause;
+    return {
+      body: emptyMethodBody(
+        rva,
+        "malformed",
+        cause instanceof Error ? cause.message : "Method body parse failed",
+      ),
+      scanned: false,
+    };
+  } finally {
+    // IL and exception-section bookkeeping coexist until the body is built.
+    budget?.releaseTransient();
   }
 };
 

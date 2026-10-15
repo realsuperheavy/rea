@@ -54,6 +54,21 @@ const report = z
 
 type NativeAotReport = z.infer<typeof report>;
 
+const validateNonRecoveryMetadata = (
+  value: NativeAotReport,
+  recovered: boolean,
+): string | null => {
+  if (recovered) return null;
+  if (value.reason === null || value.reason.trim().length === 0)
+    return "NativeAOT non-recovery status omits its required reason.";
+  return value.method_tables !== 0 ||
+    value.types !== undefined ||
+    value.derived_memory !== undefined ||
+    value.coverage !== undefined
+    ? "NativeAOT non-recovery status carries recovered metadata."
+    : null;
+};
+
 /** Validate the pinned producer representation before its result enters Evidence. */
 export const validateNativeAotReport = (
   value: GhidraExtensionResult,
@@ -75,8 +90,9 @@ export const validateNativeAotReport = (
 };
 
 const validateRecoveredMetadata = (value: NativeAotReport): string | null => {
+  const recovered = ["complete", "partial"].includes(value.status);
   if (
-    ["complete", "partial"].includes(value.status) &&
+    recovered &&
     (value.method_tables === 0 ||
       value.format_major !== 9 ||
       value.format_minor !== 1 ||
@@ -88,6 +104,8 @@ const validateRecoveredMetadata = (value: NativeAotReport): string | null => {
       value.reason !== null)
   )
     return "NativeAOT recovery omitted its supported format, method-table inventory or derived-memory identity.";
+  const nonRecoveryInvalid = validateNonRecoveryMetadata(value, recovered);
+  if (nonRecoveryInvalid !== null) return nonRecoveryInvalid;
   const coverage = value.coverage;
   if (
     coverage !== undefined &&

@@ -1,5 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parse as parseJsonc, type ParseError } from "jsonc-parser";
@@ -9,27 +9,23 @@ import { configureClientConfiguration } from "../../../src/application/SetupClie
 import { systemUninstallHost } from "../../../src/application/Uninstall.js";
 import { supportedClients } from "../../../src/application/SupportedClients.js";
 import { PRODUCT_IDENTITY } from "../../../src/identity.js";
-import { isOwnedClientRegistrationCommand } from "../../../src/application/ClientRegistrationIdentity.js";
+import {
+  classifyClientRegistrationCommand,
+  isOwnedClientRegistrationCommand,
+} from "../../../src/application/ClientRegistrationIdentity.js";
+import {
+  CURRENT_ENTRYPOINT_PATH,
+  normalizeEntrypointPath,
+} from "../../../src/process/CurrentEntrypointPath.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
+import {
+  clearClientLocationEnvironment,
+  NPX_REGISTRATION_COMMAND,
+} from "../../fixtures/clientEnvironment.js";
 
-const command = [
-  "npx",
-  "-y",
-  PRODUCT_IDENTITY.registrationPackageSpecifier,
-  "mcp",
-] as const;
+const command = NPX_REGISTRATION_COMMAND;
 
-beforeEach(() => {
-  for (const name of [
-    "APPDATA",
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "COPILOT_HOME",
-    "OPENCODE_CONFIG",
-    "XDG_CONFIG_HOME",
-  ])
-    vi.stubEnv(name, undefined);
-});
+beforeEach(clearClientLocationEnvironment);
 
 afterEach(() => vi.unstubAllEnvs());
 
@@ -42,10 +38,61 @@ const getClients = (home: string) =>
       "commandcode",
       "vscode",
       "devin",
+      "omp",
+      "pi",
     ].includes(name),
   );
 
 describe("additional client configuration dialects", () => {
+  it("does not uninstall a Node registration whose relative script only matches this process cwd", async () => {
+    if (CURRENT_ENTRYPOINT_PATH === undefined)
+      throw new Error("test runner entrypoint is unavailable");
+    const home = await createTestTempDirectory("rea-relative-uninstall-");
+    const cursor = supportedClients(home).find(({ name }) => name === "cursor");
+    if (cursor === undefined) throw new Error("missing Cursor client");
+    await mkdir(cursor.markerPath ?? home, { recursive: true });
+    const relativeScript = relative(process.cwd(), CURRENT_ENTRYPOINT_PATH);
+    const registration = {
+      command: process.execPath,
+      args: [relativeScript, "mcp"],
+    };
+    await writeFile(
+      cursor.configPath,
+      JSON.stringify({ mcpServers: { rea: registration } }),
+    );
+
+    expect(
+      await readClientRegistrationStatuses(home, CURRENT_ENTRYPOINT_PATH),
+    ).toContainEqual(
+      expect.objectContaining({
+        client: "cursor",
+        command: [process.execPath, relativeScript, "mcp"],
+        state: "unknown",
+      }),
+    );
+    await systemUninstallHost(home).removeClient(cursor);
+    const after = parseJsonc(await readFile(cursor.configPath, "utf8")) as {
+      readonly mcpServers: Readonly<Record<string, unknown>>;
+    };
+    expect(after.mcpServers.rea).toEqual(registration);
+  });
+
+  it("treats an empty XDG config home as unset for OpenCode setup", async () => {
+    const home = await createTestTempDirectory("rea-opencode-empty-xdg-");
+    const client = supportedClients(home, "linux", {
+      XDG_CONFIG_HOME: "",
+    }).find(({ name }) => name === "opencode");
+    const expectedPath = join(home, ".config/opencode/opencode.json");
+    if (client === undefined) throw new Error("missing opencode client");
+
+    expect(client.configPath).toBe(expectedPath);
+    expect(client.configPaths).toContain(expectedPath);
+    expect(
+      await configureClientConfiguration(client, {}, command),
+    ).toMatchObject({ status: "configured" });
+    expect(await readFile(expectedPath, "utf8")).toContain('"mcp"');
+  });
+
   it.each([
     "opencode",
     "antigravity",
@@ -53,12 +100,13 @@ describe("additional client configuration dialects", () => {
     "commandcode",
     "vscode",
     "devin",
+    "omp",
+    "pi",
   ] as const)("registers, reads back, and uninstalls %s", async (name) => {
     const home = await createTestTempDirectory("rea-client-dialect-");
     const client = getClients(home).find(
       (candidate) => candidate.name === name,
     );
-    expect(client).toBeDefined();
     if (client === undefined) throw new Error(`missing ${name} client`);
 
     await mkdir(client.markerPath ?? home, { recursive: true });
@@ -88,7 +136,7 @@ describe("additional client configuration dialects", () => {
         command,
         enabled: true,
       });
-    if (name === "vscode")
+    if (name === "vscode" || name === "omp" || name === "pi")
       expect(registration).toMatchObject({
         type: "stdio",
         command: "npx",
@@ -122,11 +170,12 @@ describe("additional client configuration dialects", () => {
       ],
     ).toBeUndefined();
   });
+});
 
+describe("OpenCode JSONC registration edits", () => {
   it("preserves OpenCode JSONC comments and sibling registrations during update and removal", async () => {
     const home = await createTestTempDirectory("rea-opencode-jsonc-");
     const client = getClients(home).find(({ name }) => name === "opencode");
-    expect(client).toBeDefined();
     if (client === undefined) throw new Error("missing OpenCode client");
     await mkdir(client.markerPath ?? home, { recursive: true });
     const original = `{
@@ -177,7 +226,6 @@ describe("additional client configuration dialects", () => {
   it("rejects malformed OpenCode JSONC without creating a backup or changing bytes", async () => {
     const home = await createTestTempDirectory("rea-opencode-invalid-");
     const client = getClients(home).find(({ name }) => name === "opencode");
-    expect(client).toBeDefined();
     if (client === undefined) throw new Error("missing OpenCode client");
     await mkdir(client.markerPath ?? home, { recursive: true });
     const invalid = '{ "mcp": { /* broken */ "rea": [ }';
@@ -188,6 +236,184 @@ describe("additional client configuration dialects", () => {
       reason: "readback",
     });
     expect(await readFile(client.configPath, "utf8")).toBe(invalid);
+  });
+});
+
+const parseOpenCode = (text: string): Record<string, unknown> => {
+  const errors: ParseError[] = [];
+  const document = parseJsonc(text, errors, {
+    allowTrailingComma: true,
+  }) as Record<string, unknown>;
+  expect(errors).toEqual([]);
+  return document;
+};
+
+const openCodeClient = async (prefix: string) => {
+  const home = await createTestTempDirectory(prefix);
+  const client = getClients(home).find(({ name }) => name === "opencode");
+  if (client === undefined) throw new Error("missing OpenCode client");
+  await mkdir(client.markerPath ?? home, { recursive: true });
+  return { home, client };
+};
+
+const legacyEntry = JSON.stringify({ type: "local", command, enabled: true });
+
+describe("OpenCode V2 native server table", () => {
+  it("registers in mcp.servers, replaces REA's V1 entry, and uninstalls", async () => {
+    const { home, client } = await openCodeClient("rea-opencode-v2-");
+    await writeFile(
+      client.configPath,
+      `{
+  "mcp": {
+    // Default timeouts are not a server.
+    "timeout": { "catalog": 30000 },
+    "servers": {
+      // An independently managed server.
+      "other": { "type": "local", "command": ["node", "other.js"] },
+    },
+    "rea": ${legacyEntry},
+  },
+}\n`,
+    );
+
+    expect(
+      (await configureClientConfiguration(client, {}, command)).status,
+    ).toBe("configured");
+    expect(await configureClientConfiguration(client, {}, command)).toEqual({
+      status: "unchanged",
+    });
+    const text = await readFile(client.configPath, "utf8");
+    expect(text).toContain("// Default timeouts are not a server.");
+    expect(text).toContain("// An independently managed server.");
+    expect(parseOpenCode(text).mcp).toEqual({
+      timeout: { catalog: 30000 },
+      servers: {
+        other: { type: "local", command: ["node", "other.js"] },
+        rea: { type: "local", command: [...command] },
+      },
+    });
+    expect(await readClientRegistrationStatuses(home)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          client: "opencode",
+          state: "aligned",
+          command,
+        }),
+      ]),
+    );
+
+    expect((await systemUninstallHost(home).removeClient(client)).status).toBe(
+      "removed",
+    );
+    expect(
+      parseOpenCode(await readFile(client.configPath, "utf8")).mcp,
+    ).toEqual({
+      timeout: { catalog: 30000 },
+      servers: { other: { type: "local", command: ["node", "other.js"] } },
+    });
+  });
+
+  it("updates and removes REA's entry after OpenCode migrates it to mcp.servers", async () => {
+    const { home, client } = await openCodeClient("rea-opencode-migrated-");
+    const stale = ["npx", "-y", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"];
+    await writeFile(
+      client.configPath,
+      `${JSON.stringify({ mcp: { servers: { rea: { type: "local", command: stale } } } })}\n`,
+    );
+
+    expect(await readClientRegistrationStatuses(home)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ client: "opencode", command: stale }),
+      ]),
+    );
+    expect(
+      (await configureClientConfiguration(client, {}, command)).status,
+    ).toBe("configured");
+    expect(
+      parseOpenCode(await readFile(client.configPath, "utf8")).mcp,
+    ).toEqual({
+      servers: { rea: { type: "local", command: [...command] } },
+    });
+    expect((await systemUninstallHost(home).removeClient(client)).status).toBe(
+      "removed",
+    );
+    expect(
+      parseOpenCode(await readFile(client.configPath, "utf8")).mcp,
+    ).toEqual({
+      servers: {},
+    });
+  });
+
+  it("reports and removes a V1 entry that OpenCode still loads beside mcp.servers", async () => {
+    const { home, client } = await openCodeClient("rea-opencode-mixed-");
+    await writeFile(
+      client.configPath,
+      `{ "mcp": { "servers": {}, "rea": ${legacyEntry} } }\n`,
+    );
+
+    expect(await readClientRegistrationStatuses(home)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          client: "opencode",
+          state: "aligned",
+          command,
+        }),
+      ]),
+    );
+    expect((await systemUninstallHost(home).removeClient(client)).status).toBe(
+      "removed",
+    );
+    expect(
+      parseOpenCode(await readFile(client.configPath, "utf8")).mcp,
+    ).toEqual({
+      servers: {},
+    });
+  });
+
+  it("treats a V2 table holding a server named type as native", async () => {
+    const { home, client } = await openCodeClient("rea-opencode-type-server-");
+    const typeServer = { type: "local", command: ["node", "type.js"] };
+    await writeFile(
+      client.configPath,
+      `${JSON.stringify({ mcp: { servers: { type: typeServer, rea: { type: "local", command } } } })}\n`,
+    );
+
+    expect(await readClientRegistrationStatuses(home)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          client: "opencode",
+          state: "aligned",
+          command,
+        }),
+      ]),
+    );
+    expect((await systemUninstallHost(home).removeClient(client)).status).toBe(
+      "removed",
+    );
+    expect(
+      parseOpenCode(await readFile(client.configPath, "utf8")).mcp,
+    ).toEqual({
+      servers: { type: typeServer },
+    });
+  });
+
+  it("keeps a V1 server named servers in the V1 table", async () => {
+    const { client } = await openCodeClient("rea-opencode-v1-servers-");
+    const servers = { type: "local", command: ["node", "servers.js"] };
+    await writeFile(
+      client.configPath,
+      `${JSON.stringify({ mcp: { servers } })}\n`,
+    );
+
+    expect(
+      (await configureClientConfiguration(client, {}, command)).status,
+    ).toBe("configured");
+    expect(
+      parseOpenCode(await readFile(client.configPath, "utf8")).mcp,
+    ).toEqual({
+      servers,
+      rea: { type: "local", command: [...command], enabled: true },
+    });
   });
 });
 
@@ -222,6 +448,40 @@ describe("platform-aware client config paths", () => {
       ).toBe(expected);
     },
   );
+
+  it("honors Grok Build and Grok Bot configuration roots", () => {
+    expect(
+      supportedClients("/home/a", "linux", {
+        GROK_HOME: "/custom/grok",
+        SAND_DATA_ROOT: "/custom/grokbot",
+      }).filter(({ name }) => name === "grok_build" || name === "grok_bot"),
+    ).toEqual([
+      expect.objectContaining({
+        name: "grok_build",
+        displayName: "Grok Build",
+        configPath: "/custom/grok/config.toml",
+        markerPath: "/custom/grok",
+        format: "grok",
+      }),
+      expect.objectContaining({
+        name: "grok_bot",
+        displayName: "Grok Bot",
+        configPath: "/custom/grokbot",
+        markerPath: "/custom/grokbot",
+        format: "unsupported",
+      }),
+    ]);
+    expect(
+      supportedClients("/home/a", "linux", {
+        SAND_DATA_ROOT: "relative/sand",
+      }).find(({ name }) => name === "grok_bot")?.configPath,
+    ).toBe("/home/a/.grokbot");
+    expect(
+      supportedClients("/home/a", "darwin", {}).find(
+        ({ name }) => name === "grok_build",
+      )?.configPath,
+    ).toBe("/home/a/.grok/config.toml");
+  });
 
   it("honors Copilot CLI and Devin platform configuration roots", () => {
     expect(
@@ -271,18 +531,43 @@ describe("platform-aware client config paths", () => {
       ]),
     );
   });
+});
 
+describe("client registration command ownership", () => {
   it("recognizes prior exact REA releases while rejecting foreign package commands", () => {
+    expect(isOwnedClientRegistrationCommand(["rea", "mcp"], undefined)).toBe(
+      true,
+    );
+    const cwdMatchingEntry = resolve("./rea");
     expect(
-      isOwnedClientRegistrationCommand([
-        "npx",
-        "-y",
-        `${PRODUCT_IDENTITY.packageName}@3.2.0`,
-        "mcp",
-      ]),
+      classifyClientRegistrationCommand(["./rea", "mcp"], cwdMatchingEntry),
+    ).toBe("unknown");
+    expect(
+      isOwnedClientRegistrationCommand(["./rea", "mcp"], cwdMatchingEntry),
+    ).toBe(false);
+    expect(
+      isOwnedClientRegistrationCommand(
+        ["npx", "-y", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"],
+        undefined,
+      ),
     ).toBe(true);
     expect(
-      isOwnedClientRegistrationCommand(["npx", "-y", "another-package", "mcp"]),
+      isOwnedClientRegistrationCommand(
+        ["npx", "-y", "another-package", "mcp"],
+        undefined,
+      ),
+    ).toBe(false);
+    expect(
+      isOwnedClientRegistrationCommand(
+        ["bunx", `${PRODUCT_IDENTITY.packageName}@3.2.0`, "mcp"],
+        undefined,
+      ),
+    ).toBe(true);
+    expect(
+      isOwnedClientRegistrationCommand(
+        ["bunx", "another-package", "mcp"],
+        undefined,
+      ),
     ).toBe(false);
     expect(
       isOwnedClientRegistrationCommand(
@@ -290,6 +575,12 @@ describe("platform-aware client config paths", () => {
         "/packaged/rea.mjs",
       ),
     ).toBe(true);
+    expect(
+      isOwnedClientRegistrationCommand(
+        [process.execPath, resolve("unknown"), "mcp"],
+        normalizeEntrypointPath(""),
+      ),
+    ).toBe(false);
     expect(
       isOwnedClientRegistrationCommand(
         ["node", "/packaged/other-agent.mjs", "mcp"],

@@ -1,37 +1,49 @@
+import { parseMcpToolError } from "../../fixtures/mcpToolError.js";
+import { parseEvidence } from "../../../src/domain/evidence.js";
+import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import type { CallToolResult } from "@modelcontextprotocol/server";
+import { Ajv2020 } from "ajv/dist/2020.js";
 import { expect, it } from "vitest";
 import { z } from "zod";
 
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
-import { AnalysisProviderRegistry } from "../../../src/application/AnalysisProviderRegistry.js";
-import { composeBinarySession } from "../../../src/application/BinarySessionComposition.js";
-import type { BinarySession } from "../../../src/application/BinarySession.js";
-import type { BinaryTarget } from "../../../src/domain/binaryTarget.js";
-import { SessionProviderRouter } from "../../../src/application/SessionProviderRouter.js";
-import { MANAGED_NATIVE_VERIFICATION_EXAMPLE } from "../../../src/contracts/managedWorkflowExamples.js";
+import { AnalysisProviderRegistry } from "../../../src/application/binary/AnalysisProviderRegistry.js";
+import { composeBinarySession } from "../../../src/application/binary/BinarySessionComposition.js";
+import type { BinarySession } from "../../../src/application/binary/BinarySession.js";
+import { MANAGED_NATIVE_VERIFICATION_EXAMPLE } from "../../../src/contracts/managed/managedWorkflowExamples.js";
+import { toolContract } from "../../../src/contracts/toolContracts.js";
 import { ManagedStaticProvider } from "../../../src/dotnet/ManagedStaticProvider.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { buildManagedPeFixture } from "../../../src/dotnet/ManagedPe.fixture.js";
+
+type ManagedOutputAssertion = Awaited<ReturnType<typeof createOutputAssertion>>;
 
 it("runs every managed static inspection independently of an active native target", async () => {
   const directory = await createTestTempDirectory(
     "rea-managed-independent-mcp-",
   );
   const path = join(directory, "fixture.dll");
+  const otherPath = join(directory, "other-fixture.dll");
+  const partialPath = join(directory, "partial-method.dll");
   await writeFile(path, buildManagedPeFixture());
-  const session = composeBinarySession(
-    SessionProviderRouter.selectable(new AnalysisProviderRegistry([]), [
-      new ManagedStaticProvider(),
-    ]),
+  await writeFile(otherPath, buildManagedPeFixture({ methodName: "Other" }));
+  await writeFile(
+    partialPath,
+    buildManagedPeFixture({
+      virtualSectionSize: 0x801,
+      ilBody: Buffer.from([0x06, 0x2a]),
+    }),
   );
+  const session = composeBinarySession(new AnalysisProviderRegistry([]), [
+    new ManagedStaticProvider(),
+  ]);
   const server = createServer(
-    session,
-    sessionWithUnrelatedNativeTarget(session),
+    { kind: "session", session },
     {
       availabilityPolicy: () => ({
         processCaptureEnabled: false,
@@ -50,6 +62,12 @@ it("runs every managed static inspection independently of an active native targe
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
+    const managedMembersTool = (await client.listTools()).tools.find(
+      ({ name }) => name === "inspect_managed_members",
+    );
+    expect(managedMembersTool?.inputSchema).toMatchObject({
+      additionalProperties: false,
+    });
     const artifact = structured(
       await client.callTool({
         name: "inspect_managed_artifact",
@@ -57,12 +75,15 @@ it("runs every managed static inspection independently of an active native targe
       }),
     );
     expect(artifact).toMatchObject({
-      evidence: {
-        operation: "inspect_managed_artifact",
-        provider: { id: "rea-dotnet-static" },
-        subject: { local_path: path, format: "pe" },
-      },
+      operation: "inspect_managed_artifact",
+      provider: { id: "rea-dotnet-static" },
+      subject: { local_path: path, format: "pe" },
     });
+    const misspelledPath = await client.callTool({
+      name: "inspect_managed_members",
+      arguments: { pth: otherPath },
+    });
+    expect(misspelledPath.isError).toBe(true);
     const invalidSelection = await client.callTool({
       name: "inspect_managed_artifact",
       arguments: { path: join(directory, "missing.dll") },
@@ -72,12 +93,27 @@ it("runs every managed static inspection independently of an active native targe
       await client.callTool({ name: "inspect_managed_members", arguments: {} }),
     );
     expect(members).toMatchObject({
-      evidence: {
-        operation: "inspect_managed_members",
-        provider: { id: "rea-dotnet-static" },
-        subject: { local_path: path, format: "pe" },
-      },
+      operation: "inspect_managed_members",
+      provider: { id: "rea-dotnet-static" },
+      subject: { local_path: path, format: "pe" },
     });
+    const otherArtifact = structured(
+      await client.callTool({
+        name: "inspect_managed_artifact",
+        arguments: { path: otherPath },
+      }),
+    );
+    expect(otherArtifact).toMatchObject({
+      subject: { local_path: otherPath, format: "pe" },
+    });
+    const reusedOtherTarget = structured(
+      await client.callTool({ name: "inspect_managed_members", arguments: {} }),
+    );
+    expect(reusedOtherTarget).toMatchObject({
+      operation: "inspect_managed_members",
+      subject: { local_path: otherPath, format: "pe" },
+    });
+    await verifyManagedTypeSelection(client, path, otherPath);
     const boundaries = structured(
       await client.callTool({
         name: "inspect_managed_native_boundaries",
@@ -85,10 +121,29 @@ it("runs every managed static inspection independently of an active native targe
       }),
     );
     expect(boundaries).toMatchObject({
-      evidence: {
-        operation: "inspect_managed_native_boundaries",
-        provider: { id: "rea-dotnet-static" },
-        subject: { local_path: path, format: "pe" },
+      operation: "inspect_managed_native_boundaries",
+      provider: { id: "rea-dotnet-static" },
+      subject: { local_path: path, format: "pe" },
+    });
+    const partial = structured(
+      await client.callTool({
+        name: "inspect_managed_members",
+        arguments: { path: partialPath },
+      }),
+    );
+    expect(partial).toMatchObject({
+      subject: { local_path: partialPath, format: "pe" },
+      normalized_result: {
+        methods: [
+          {
+            body: {
+              status: "malformed",
+              normalized_il_sha256: null,
+              issue: "Method body leaves file-backed PE section data",
+            },
+          },
+        ],
+        coverage: { state: "partial" },
       },
     });
   } finally {
@@ -103,14 +158,11 @@ it("opens a managed PE and executes the managed static provider through MCP", as
   const rightPath = join(directory, "fixture-renamed.exe");
   await writeFile(path, buildManagedPeFixture());
   await writeFile(rightPath, buildManagedPeFixture({ methodName: "Renamed" }));
-  const session = composeBinarySession(
-    SessionProviderRouter.selectable(new AnalysisProviderRegistry([]), [
-      new ManagedStaticProvider(),
-    ]),
-  );
+  const session = composeBinarySession(new AnalysisProviderRegistry([]), [
+    new ManagedStaticProvider(),
+  ]);
   const server = createServer(
-    session,
-    sessionWithUnrelatedNativeTarget(session),
+    { kind: "session", session },
     {
       availabilityPolicy: () => ({
         processCaptureEnabled: false,
@@ -126,9 +178,19 @@ it("opens a managed PE and executes the managed static provider through MCP", as
   try {
     await server.connect(serverTransport);
     await client.connect(clientTransport);
-    await verifyManagedCatalogAndNativeWorkflow(client, session);
-    const members = await inspectManagedStaticWorkflow(client, path);
-    await verifyManagedComparisonAndReconstruction(client, members, rightPath);
+    const assertOutput = await createOutputAssertion(client);
+    await verifyManagedCatalogAndNativeWorkflow(client, session, assertOutput);
+    const members = await inspectManagedStaticWorkflow(
+      client,
+      path,
+      assertOutput,
+    );
+    await verifyManagedComparisonAndReconstruction(
+      client,
+      members,
+      rightPath,
+      assertOutput,
+    );
   } finally {
     await Promise.all([client.close(), server.close()]);
     await session.close();
@@ -138,9 +200,9 @@ it("opens a managed PE and executes the managed static provider through MCP", as
 const verifyManagedCatalogAndNativeWorkflow = async (
   client: Client,
   session: BinarySession,
+  outputAssertion: ManagedOutputAssertion,
 ): Promise<void> => {
-  const names = (await client.listTools()).tools.map(({ name }) => name);
-  expect(names).toEqual(
+  expect(outputAssertion.names).toEqual(
     expect.arrayContaining([
       "inspect_managed_artifact",
       "inspect_managed_members",
@@ -166,9 +228,10 @@ const verifyManagedCatalogAndNativeWorkflow = async (
       },
     }),
   );
+  await outputAssertion.assert("verify_managed_native_boundaries", verified);
   expect(verified).toMatchObject({
     evidence_id: expect.stringMatching(/^ev_[a-f0-9]{64}$/u),
-    result: {
+    normalized_result: {
       summary: { verified: 1 },
       algorithm: { token_to_address_mapping: "not-inferred" },
     },
@@ -184,17 +247,15 @@ const verifyManagedCatalogAndNativeWorkflow = async (
       ],
     },
   });
-  expect(wrong).toMatchObject({
-    isError: true,
-    structuredContent: {
-      error: { code: "evidence_integrity_mismatch" },
-    },
+  expect(parseMcpToolError(wrong)).toMatchObject({
+    error: { code: "evidence_integrity_mismatch" },
   });
 };
 
 const inspectManagedStaticWorkflow = async (
   client: Client,
   path: string,
+  outputAssertion: ManagedOutputAssertion,
 ): Promise<Record<string, unknown>> => {
   const inspected = structured(
     await client.callTool({
@@ -202,8 +263,9 @@ const inspectManagedStaticWorkflow = async (
       arguments: { path },
     }),
   );
+  await outputAssertion.assert("inspect_managed_artifact", inspected);
   expect(inspected).toMatchObject({
-    result: {
+    normalized_result: {
       classification: { status: "managed", runtime_family: "modern-dotnet" },
       references: [expect.objectContaining({ name: "System.Runtime" })],
     },
@@ -221,6 +283,7 @@ const inspectManagedStaticWorkflow = async (
       }),
     ),
   );
+  await outputAssertion.assert("inspect_managed_members", members);
   expect(members).toMatchObject({
     operation: "inspect_managed_members",
     provider: { id: "rea-dotnet-static" },
@@ -242,36 +305,15 @@ const inspectManagedStaticWorkflow = async (
       arguments: { path },
     }),
   );
+  await outputAssertion.assert("inspect_managed_native_boundaries", boundaries);
   expect(boundaries).toMatchObject({
-    result: {
+    normalized_result: {
       identity_scope: { token_identity: "build-local" },
       pinvoke_imports: [],
       native_implementations: [],
     },
   });
   return members;
-};
-
-const sessionWithUnrelatedNativeTarget = (
-  session: BinarySession,
-): BinarySession => {
-  const nativeTarget: BinaryTarget = {
-    kind: "executable",
-    format: "pe",
-    path: "C:\\Windows\\System32\\notepad.exe",
-    sha256: "a".repeat(64),
-    architecture: "x86_64",
-    availableArchitectures: ["x86_64"],
-    executableRole: "application",
-    managed: false,
-  };
-  return new Proxy(session, {
-    get(target, property, receiver) {
-      if (property === "activeTarget") return () => nativeTarget;
-      const value: unknown = Reflect.get(target, property, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
 };
 
 const methodFrom = (members: Record<string, unknown>) =>
@@ -292,6 +334,7 @@ const verifyManagedComparisonAndReconstruction = async (
   client: Client,
   members: Record<string, unknown>,
   rightPath: string,
+  outputAssertion: ManagedOutputAssertion,
 ): Promise<void> => {
   await client.callTool({
     name: "open_binary",
@@ -316,6 +359,7 @@ const verifyManagedComparisonAndReconstruction = async (
       }),
     ),
   );
+  await outputAssertion.assert("compare_managed_members", compared);
   expect(compared).toMatchObject({
     operation: "compare_managed_members",
     provider: { id: "rea-dotnet-workflows" },
@@ -372,20 +416,90 @@ const verifyImport = async (
     operation: "import_managed_reconstruction",
     provider: { id: "rea-dotnet-workflows" },
     confidence: "inferred",
+    authority: "analyst-inference",
     normalized_result: {
+      phase: "reconstruction-import",
       executed: false,
+      decompiler: { name: "ilspycmd", version: "9.1.0.7988", family: "ilspy" },
       summary: { imported_methods: 1, decompiled_csharp_methods: 1 },
       methods: [
         {
           token: method.token,
-          validation: { canonical_observation: false },
+          signature_sha256: method.signature.raw_sha256,
+          normalized_il_sha256: method.body.normalized_il_sha256,
+          reconstruction: {
+            kind: "decompiled-csharp",
+            language: "csharp",
+            text_sha256: createHash("sha256")
+              .update("internal static void Main() { }")
+              .digest("hex"),
+          },
+          validation: {
+            matched_static_member: true,
+            exact_build_required: true,
+            canonical_observation: false,
+            confidence_floor: "inference",
+          },
         },
       ],
     },
   });
 };
 
+/** Selected type names reach the provider and unmatched names stay visible. */
+const verifyManagedTypeSelection = async (
+  client: Client,
+  path: string,
+  otherPath: string,
+): Promise<void> => {
+  const advertised = (await client.listTools()).tools.find(
+    (tool) => tool.name === "inspect_managed_members",
+  );
+  if (advertised === undefined) throw new Error("missing managed member tool");
+  const ajv = new Ajv2020({ strict: false, validateFormats: false });
+  expect(ajv.validateSchema(advertised.inputSchema)).toBe(true);
+  const validate = ajv.compile(advertised.inputSchema);
+  expect(
+    validate({ path, type_names: ["Fixture.Program", "Missing.Type"] }),
+  ).toBe(true);
+  expect(
+    validate({ path, type_names: ["Fixture.Program", "Fixture.Program"] }),
+  ).toBe(false);
+  const selected = structured(
+    await client.callTool({
+      name: "inspect_managed_members",
+      arguments: { path, type_names: ["Fixture.Program", "Missing.Type"] },
+    }),
+  );
+  expect(selected).toMatchObject({
+    parameters: { path, type_names: ["Fixture.Program", "Missing.Type"] },
+    normalized_result: {
+      types: [expect.objectContaining({ full_name: "Fixture.Program" })],
+      methods: [expect.objectContaining({ declaring_type: "Fixture.Program" })],
+      selection: {
+        type_names: ["Fixture.Program", "Missing.Type"],
+        unmatched_type_names: ["Missing.Type"],
+      },
+    },
+  });
+  const repeatedSelection = await client.callTool({
+    name: "inspect_managed_members",
+    arguments: { path, type_names: ["Fixture.Program", "Fixture.Program"] },
+  });
+  expect(repeatedSelection.isError).toBe(true);
+  const reselectedOtherTarget = structured(
+    await client.callTool({
+      name: "inspect_managed_artifact",
+      arguments: { path: otherPath },
+    }),
+  );
+  expect(reselectedOtherTarget).toMatchObject({
+    subject: { local_path: otherPath, format: "pe" },
+  });
+};
+
 const structured = (result: CallToolResult): Record<string, unknown> => {
+  if (result.isError === true) return parseMcpToolError(result);
   if (
     typeof result.structuredContent !== "object" ||
     result.structuredContent === null
@@ -394,19 +508,33 @@ const structured = (result: CallToolResult): Record<string, unknown> => {
   return z.record(z.string(), z.unknown()).parse(result.structuredContent);
 };
 
+const createOutputAssertion = async (client: Client) => {
+  const tools = (await client.listTools()).tools;
+  const ajv = new Ajv2020({
+    strict: false,
+    validateFormats: false,
+  });
+  return {
+    names: tools.map(({ name }) => name),
+    assert: (
+      name: Parameters<typeof toolContract>[0],
+      output: Record<string, unknown>,
+    ): void => {
+      const contract = toolContract(name);
+      const wire = tools.find((tool) => tool.name === name);
+      if (wire?.outputSchema === undefined)
+        throw new Error(`Missing advertised output schema for ${name}`);
+      const valid = ajv.compile(
+        z.record(z.string(), z.unknown()).parse(wire.outputSchema),
+      );
+      expect(valid(output), `${name} advertised output`).toBe(true);
+      expect(contract.outputSchema.safeParse(output).success).toBe(true);
+    },
+  };
+};
+
 const inlineEvidence = (
   value: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> => {
-  const parsed = z
-    .object({
-      evidence_id: z.string(),
-      result: z.unknown(),
-      evidence: z.object({}).passthrough(),
-    })
-    .parse(value);
-  return {
-    ...parsed.evidence,
-    evidence_id: parsed.evidence_id,
-    normalized_result: parsed.result,
-  };
+  return parseEvidence(value);
 };

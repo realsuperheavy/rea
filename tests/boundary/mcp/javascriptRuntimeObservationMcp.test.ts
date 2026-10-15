@@ -1,3 +1,4 @@
+import { ok as resultOk } from "../../../src/domain/result.js";
 import { rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -6,16 +7,16 @@ import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { createTestBinarySession } from "../../fixtures/binarySession.js";
-import { observeJavaScriptRuntime } from "../../../src/application/JavaScriptRuntimeObservationService.js";
-import { V8InspectorProvider } from "../../../src/browser/V8InspectorProvider.js";
+import { observeJavaScriptRuntime } from "../../../src/application/javascript/JavaScriptRuntimeObservationService.js";
+import { V8InspectorProvider } from "../../../src/inspector/V8InspectorProvider.js";
 import {
   javascriptRuntimeObservationSchema,
   javascriptRuntimeTargetListSchema,
   observeJavaScriptRuntimeInputSchema,
-} from "../../../src/domain/javascriptRuntimeObservation.js";
+} from "../../../src/domain/javascript/javascriptRuntimeObservation.js";
 import { createServer } from "../../../src/server/createServer.js";
 import { observed } from "../../fixtures/analysisExecution.js";
-import { startFakeV8Inspector } from "../../fixtures/fakeV8Inspector.js";
+import { startFakeV8Inspector } from "../../fixtures/inspector/fakeV8Inspector.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
 describe("JavaScript runtime observation MCP tools", () => {
@@ -119,7 +120,7 @@ describe("JavaScript runtime observation MCP tools", () => {
     });
     expect(listed.isError).not.toBe(true);
     expect(listed.structuredContent).toMatchObject({
-      result: {
+      normalized_result: {
         targets: [{ target_id: inspector.targetId }],
       },
     });
@@ -134,7 +135,7 @@ describe("JavaScript runtime observation MCP tools", () => {
     });
     expect(observedRuntime.isError).not.toBe(true);
     expect(observedRuntime.structuredContent).toMatchObject({
-      result: {
+      normalized_result: {
         target: {
           target_id: inspector.targetId,
           runtime_kind: "node",
@@ -151,11 +152,9 @@ describe("JavaScript runtime observation MCP tools", () => {
     });
     const evidenceId = evidenceIdFrom(observedRuntime.structuredContent);
     expect(observedRuntime.structuredContent).toMatchObject({
-      evidence: {
-        evidence_id: evidenceId,
-        operation: "observe_javascript_runtime",
-        parameters: expect.any(Object),
-      },
+      evidence_id: evidenceId,
+      operation: "observe_javascript_runtime",
+      parameters: expect.any(Object),
     });
     expect(new Set(inspector.commands.map(({ method }) => method))).toEqual(
       new Set(["Runtime.enable", "Debugger.enable"]),
@@ -178,15 +177,18 @@ const createObservationClient = async (
   resources.push(inspector);
   const session = createTestBinarySession(() => ({
     execute: () => Promise.resolve(observed(null)),
-    close: () => Promise.resolve(),
+    close: () => Promise.resolve(resultOk(null)),
   }));
-  const server = createServer(session, session, {
-    javascriptRuntimeObservation: new V8InspectorProvider(),
-    availabilityPolicy: () => ({
-      processCaptureEnabled: false,
-      investigationInputRoots: 0,
-    }),
-  });
+  const server = createServer(
+    { kind: "session", session },
+    {
+      javascriptRuntimeObservation: new V8InspectorProvider(),
+      availabilityPolicy: () => ({
+        processCaptureEnabled: false,
+        investigationInputRoots: 0,
+      }),
+    },
+  );
   const client = new Client({ name: "v8-mcp-test", version: "1" });
   const [clientTransport, serverTransport] =
     InMemoryTransport.createLinkedPair();

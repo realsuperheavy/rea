@@ -1,11 +1,11 @@
-import type { WebPageInspection } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { CdpCaptureEvents } from "./CdpCaptureEvents.js";
 import {
   allowedSanitizedUrl,
   isHttpUrl,
   recordValue,
   recordsValue,
-  stringValue,
+  cdpStringValue,
 } from "./CdpCaptureValues.js";
 import type { CaptureContext } from "./CdpPageCapture.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
@@ -32,19 +32,19 @@ export const captureWorkers = async (
   const items: WebPageInspection["workers"] = [];
   if (result === undefined) completeness.unavailable("workers");
   for (const target of recordsValue(recordValue(result)?.targetInfos)) {
-    const type = stringValue(target.type) ?? "";
+    const type = cdpStringValue(target.type) ?? "";
     const url = allowedSanitizedUrl(target.url, allowedOrigins);
     const relatedToPage =
-      stringValue(target.openerId) === context.target.id ||
-      (stringValue(target.parentFrameId) !== undefined &&
-        frameIds.has(stringValue(target.parentFrameId) ?? ""));
+      cdpStringValue(target.openerId) === context.target.id ||
+      (cdpStringValue(target.parentFrameId) !== undefined &&
+        frameIds.has(cdpStringValue(target.parentFrameId) ?? ""));
     if (!type.includes("worker")) continue;
     if (!relatedToPage) {
       completeness.exclude("workers", "out_of_target_scope");
       continue;
     }
     if (url === undefined) {
-      const rawUrl = stringValue(target.url);
+      const rawUrl = cdpStringValue(target.url);
       completeness.exclude(
         "workers",
         rawUrl === undefined || rawUrl === ""
@@ -55,14 +55,18 @@ export const captureWorkers = async (
       );
       continue;
     }
+    if (typeof target.attached !== "boolean") {
+      completeness.exclude("workers", "invalid_protocol_value");
+      continue;
+    }
     items.push({
-      target_id: stringValue(target.targetId) ?? "",
+      target_id: cdpStringValue(target.targetId) ?? "",
       type,
       url: url.url,
       origin: url.origin,
-      attached: target.attached === true,
-      opener_target_id: stringValue(target.openerId) ?? null,
-      parent_frame_id: stringValue(target.parentFrameId) ?? null,
+      attached: target.attached,
+      opener_target_id: cdpStringValue(target.openerId) ?? null,
+      parent_frame_id: cdpStringValue(target.parentFrameId) ?? null,
     });
   }
   return items;

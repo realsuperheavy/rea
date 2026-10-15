@@ -1,13 +1,14 @@
 import type {
   ElectronPageInspection,
   InspectElectronPageInput,
-} from "../domain/electronObservation.js";
+} from "../domain/javascript/electronObservation.js";
 import type { CdpConnection } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
-import { recordValue, recordsValue, stringValue } from "./CdpCaptureValues.js";
+import { recordValue, cdpStringValue } from "./CdpCaptureValues.js";
 import type { CdpEndpointTarget } from "./CdpEndpoint.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
 import { authorizedElectronFile } from "./ElectronFileScope.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 /** Inventory local worker targets without attaching to them. */
 export const captureElectronWorkers = async (input: {
@@ -34,8 +35,19 @@ export const captureElectronWorkers = async (input: {
     return [];
   }
   const workers: ElectronPageInspection["workers"] = [];
-  for (const target of recordsValue(recordValue(result)?.targetInfos)) {
-    const type = stringValue(target.type) ?? "";
+  // A missing target list or a non-record entry is unreadable, not empty.
+  const targetInfos = recordValue(result)?.targetInfos;
+  if (!Array.isArray(targetInfos)) {
+    input.completeness.exclude("workers", "invalid_protocol_value", null);
+    return [];
+  }
+  for (const entry of targetInfos) {
+    const target = recordValue(entry);
+    if (target === undefined) {
+      input.completeness.exclude("workers", "invalid_protocol_value");
+      continue;
+    }
+    const type = cdpStringValue(target.type) ?? "";
     if (!type.includes("worker")) continue;
     const openerTargetId = boundedTargetField(target.openerId);
     const parentFrameId = boundedTargetField(target.parentFrameId);
@@ -46,7 +58,7 @@ export const captureElectronWorkers = async (input: {
       input.completeness.exclude("workers", "out_of_target_scope");
       continue;
     }
-    const path = await authorizedElectronFile(stringValue(target.url) ?? "");
+    const path = await authorizedElectronFile(cdpStringValue(target.url) ?? "");
     if (path === undefined) {
       input.completeness.exclude("workers", "out_of_target_scope");
       continue;
@@ -56,21 +68,25 @@ export const captureElectronWorkers = async (input: {
       input.completeness.exclude("workers", "invalid_protocol_value");
       continue;
     }
+    if (typeof target.attached !== "boolean") {
+      input.completeness.exclude("workers", "invalid_protocol_value");
+      continue;
+    }
     workers.push({
       target_id: targetId,
       type,
       file_path: path,
-      attached: target.attached === true,
+      attached: target.attached,
       opener_target_id: openerTargetId,
       parent_frame_id: parentFrameId,
     });
   }
   return workers.sort((left, right) =>
-    left.target_id.localeCompare(right.target_id),
+    compareUnicodeCodePoints(left.target_id, right.target_id),
   );
 };
 
 const boundedTargetField = (value: unknown): string | null => {
-  const field = stringValue(value);
+  const field = cdpStringValue(value);
   return field === undefined || field === "" ? null : field;
 };

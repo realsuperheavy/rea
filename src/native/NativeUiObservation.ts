@@ -1,21 +1,31 @@
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import {
+  isMachOFormat,
+  type BinaryTarget,
+} from "../domain/binaryTargetTypes.js";
 import {
   nativeUiObservationInputSchema,
   nativeUiScenarioInputSchema,
   nativeUiSnapshotSchema,
   nativeUiResultSchema,
-} from "../domain/nativeUiObservation.js";
+} from "../domain/native/nativeUiObservation.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
   AnalysisInputError,
 } from "../domain/analysisErrorCore.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
-import { type AnalysisError } from "../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
 import { err, ok, type Result } from "../domain/result.js";
-import { createNativeUiHelperRuntime } from "./NativeUiHelperRuntime.js";
+import {
+  createNativeUiHelperRuntime,
+  type NativeUiHelperRuntime,
+} from "./NativeUiHelperRuntime.js";
+import {
+  NATIVE_UI_OUTPUT_BUDGET_BYTES,
+  NATIVE_UI_OUTPUT_WEIGHT,
+} from "./NativeUiOutputBudget.js";
 
 const helper = fileURLToPath(
   new URL("../../bridge/native/ReaNativeUI.swift", import.meta.url),
@@ -39,16 +49,22 @@ export const observeNativeUi = async (
   target: BinaryTarget,
   operation: "observe_native_ui" | "capture_native_ui_scenario",
   parameters: unknown,
-  options: { signal?: AbortSignal | undefined; invoke?: NativeUiHelper } = {},
+  options: {
+    environment: Readonly<NodeJS.ProcessEnv>;
+    signal?: AbortSignal | undefined;
+    invoke?: NativeUiHelper;
+    runtime?: NativeUiHelperRuntime;
+  },
 ): Promise<Result<z.infer<typeof nativeUiResultSchema>, AnalysisError>> => {
-  const runtime = createNativeUiHelperRuntime();
+  const runtime =
+    options.runtime ?? createNativeUiHelperRuntime(options.environment);
   try {
     return await observeWithHelper(target, operation, parameters, {
       ...options,
       invoke: options.invoke ?? runtime.invoke,
     });
   } finally {
-    await runtime.close();
+    if (options.runtime === undefined) await runtime.close();
   }
 };
 
@@ -65,7 +81,7 @@ const observeWithHelper = async (
   ).safeParse(parameters);
   if (!parsed.success)
     return err(new AnalysisInputError(operation, { cause: parsed.error }));
-  if (target.kind !== "executable" || target.format !== "mach-o")
+  if (target.kind !== "executable" || !isMachOFormat(target.format))
     return err(
       new AnalysisCapabilityUnavailableError(
         "native-macos",
@@ -135,8 +151,10 @@ const observeWithHelper = async (
           ),
         );
       launchTime = response.result.window.launch_time;
-      outputBytes += 2 * Buffer.byteLength(JSON.stringify(response.result));
-      if (outputBytes > 64 * 1024 * 1024)
+      outputBytes +=
+        NATIVE_UI_OUTPUT_WEIGHT *
+        Buffer.byteLength(JSON.stringify(response.result));
+      if (outputBytes > NATIVE_UI_OUTPUT_BUDGET_BYTES)
         return err(
           new AnalysisCapabilityUnavailableError(
             "native-macos",
@@ -153,7 +171,8 @@ const observeWithHelper = async (
               cause,
               diagnostics: {
                 helper_path: helper,
-                reason:
+                reason: cause instanceof Error ? cause.message : String(cause),
+                remediation:
                   "Native helper failed, timed out, or returned malformed capture data; install compatible Xcode command-line tools and inspect local OS permissions",
               },
             }),

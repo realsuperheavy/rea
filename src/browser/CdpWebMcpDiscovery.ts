@@ -5,7 +5,12 @@ import type {
   DiscoverWebMcpToolsInput,
   WebMcpDiscovery,
 } from "../domain/webMcpDiscovery.js";
-import { inferJsonShape } from "../domain/jsonShape.js";
+import { jsonValueSchema } from "../domain/jsonValue.js";
+import { digestCanonicalValue } from "../domain/canonicalDigest.js";
+import {
+  compareUnicodeCodePoints,
+  compositeKey,
+} from "../domain/unicodeCodePointOrder.js";
 import type { CdpEndpointDiscovery, CdpEndpointTarget } from "./CdpEndpoint.js";
 import type { CdpConnection, CdpEvent } from "./CdpConnection.js";
 import { CdpCaptureCompleteness } from "./CdpCaptureCompleteness.js";
@@ -16,7 +21,7 @@ import {
   numberValue,
   recordValue,
   recordsValue,
-  stringValue,
+  cdpStringValue,
   type UnknownRecord,
 } from "./CdpCaptureValues.js";
 import {
@@ -173,10 +178,13 @@ const initialFrameScope = (
     completeness.exclude("webmcp_tools", "invalid_protocol_value"),
   )) {
     const frame = recordValue(tree.frame);
-    const frameId = stringValue(frame?.id);
+    const frameId = cdpStringValue(frame?.id);
     const prior = frameId === undefined ? undefined : scoped.get(frameId);
     if (frameId !== undefined && prior !== undefined)
-      scoped.set(frameId, { ...prior, loaderId: stringValue(frame?.loaderId) });
+      scoped.set(frameId, {
+        ...prior,
+        loaderId: cdpStringValue(frame?.loaderId),
+      });
   }
   return scoped;
 };
@@ -203,7 +211,7 @@ const handleFrameDetached = (
   params: UnknownRecord,
   state: FrameScopeState,
 ): boolean => {
-  const frameId = stringValue(params.frameId);
+  const frameId = cdpStringValue(params.frameId);
   if (frameId === undefined) {
     state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
     return true;
@@ -223,12 +231,12 @@ const handleFrameUpdate = (
     state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
     return true;
   }
-  const frameId = stringValue(frame?.id) ?? stringValue(frame?.frameId);
+  const frameId = cdpStringValue(frame?.id) ?? cdpStringValue(frame?.frameId);
   if (frameId === undefined) {
     state.completeness.exclude("webmcp_tools", "invalid_protocol_value");
     return true;
   }
-  const rawUrl = stringValue(frame?.url);
+  const rawUrl = cdpStringValue(frame?.url);
   // Chromium can briefly commit an inherited, empty document while replacing
   // a subframe. That intermediate URL says nothing about the frame's eventual
   // scope or its registered tools; wait for the next committed URL (or the
@@ -259,7 +267,7 @@ const updateFrameScope = (
     return;
   }
   const previous = state.frames.get(frameId);
-  const loaderId = stringValue(frame?.loaderId);
+  const loaderId = cdpStringValue(frame?.loaderId);
   if (hasNewDocument(documentCommitted, previous, url.url, loaderId))
     removeFrameTools(frameId, state.tools);
   if (documentCommitted && state.transientFrames.has(frameId))
@@ -269,7 +277,7 @@ const updateFrameScope = (
     origin: url.origin,
     ...(loaderId === undefined ? {} : { loaderId }),
     parentFrameId:
-      (stringValue(frame?.parentId) ??
+      (cdpStringValue(frame?.parentId) ??
         state.frames.get(frameId)?.parentFrameId ??
         "") ||
       null,
@@ -360,21 +368,31 @@ const ingestWebMcpEvent = (options: WebMcpIngestOptions): void => {
     transientFrames,
     resolvedTransientFrames,
   } = options;
+  if (
+    event.method !== "WebMCP.toolsAdded" &&
+    event.method !== "WebMCP.toolsRemoved"
+  )
+    return;
   const params = recordValue(event.params);
-  if (params === undefined) return;
+  if (params === undefined) {
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return;
+  }
   if (event.method === "WebMCP.toolsRemoved") {
-    for (const removed of recordsValue(params.tools)) {
-      const name = stringValue(removed.name);
-      const frameId = stringValue(removed.frameId);
-      if (name === undefined || frameId === undefined) continue;
+    for (const removed of webMcpEventTools(params.tools, completeness)) {
+      const name = cdpStringValue(removed.name);
+      const frameId = cdpStringValue(removed.frameId);
+      if (name === undefined || frameId === undefined) {
+        completeness.exclude("webmcp_tools", "invalid_protocol_value");
+        continue;
+      }
       for (const [key, tool] of tools)
         if (tool.name === name && tool.frame_id === frameId) tools.delete(key);
     }
     return;
   }
-  if (event.method !== "WebMCP.toolsAdded") return;
-  for (const declared of recordsValue(params.tools)) {
-    const frameId = stringValue(declared.frameId);
+  for (const declared of webMcpEventTools(params.tools, completeness)) {
+    const frameId = cdpStringValue(declared.frameId);
     if (frameId !== undefined && transientFrames.has(frameId)) {
       if (!resolvedTransientFrames.has(frameId)) continue;
       transientFrames.delete(frameId);
@@ -386,6 +404,26 @@ const ingestWebMcpEvent = (options: WebMcpIngestOptions): void => {
   }
 };
 
+const webMcpEventTools = (
+  value: unknown,
+  completeness: CdpCaptureCompleteness,
+): UnknownRecord[] => {
+  if (!Array.isArray(value)) {
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return [];
+  }
+  const records: UnknownRecord[] = [];
+  for (const item of value) {
+    const record = recordValue(item);
+    if (record === undefined) {
+      completeness.exclude("webmcp_tools", "invalid_protocol_value");
+      continue;
+    }
+    records.push(record);
+  }
+  return records;
+};
+
 const normalizeTool = (
   value: UnknownRecord,
   input: DiscoverWebMcpToolsInput,
@@ -395,22 +433,43 @@ const normalizeTool = (
   >,
   completeness: CdpCaptureCompleteness,
 ): WebMcpDiscovery["tools"]["items"][number] | undefined => {
-  const frameId = stringValue(value.frameId);
-  const name = stringValue(value.name);
+  const frameId = cdpStringValue(value.frameId);
+  const name = cdpStringValue(value.name);
   const frame = frameId === undefined ? undefined : frames.get(frameId);
-  if (
-    frameId === undefined ||
-    name === undefined ||
-    frame?.origin === null ||
-    frame === undefined
-  ) {
+  if (frameId === undefined || name === undefined) {
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return undefined;
+  }
+  if (frame?.origin === null || frame === undefined) {
     completeness.exclude("webmcp_tools", "out_of_target_scope");
     return undefined;
   }
-  const description = stringValue(value.description) ?? "";
+  const description = cdpStringValue(value.description) ?? "";
   const annotations = recordValue(value.annotations);
+  const malformedAnnotations =
+    Object.hasOwn(value, "annotations") && annotations === undefined;
+  if (malformedAnnotations)
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+  const annotation = (key: string): boolean | null => {
+    if (annotations === undefined || !Object.hasOwn(annotations, key))
+      return null;
+    const hint = annotations[key];
+    if (typeof hint === "boolean") return hint;
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+    return null;
+  };
+  const consequential = annotation("consequential");
+  const unknownConsequential =
+    malformedAnnotations ||
+    (annotations !== undefined &&
+      Object.hasOwn(annotations, "consequential") &&
+      typeof annotations.consequential !== "boolean");
+  const declaration = jsonValueSchema.safeParse(value.inputSchema);
+  if (!declaration.success)
+    completeness.exclude("webmcp_tools", "invalid_protocol_value");
+  const schema = declaration.success ? declaration.data : null;
   return {
-    tool_key: toolKey(frame.url, name),
+    tool_key: toolKey(frame.url, frameId, name),
     name,
     description,
     frame_id: frameId,
@@ -420,11 +479,15 @@ const normalizeTool = (
       numberValue(value.backendNodeId) === undefined
         ? "imperative"
         : "declarative",
-    input_schema_shape: schemaShape(value.inputSchema),
+    input_schema: schema,
+    input_schema_sha256: declaration.success
+      ? digestCanonicalValue(schema)
+      : null,
     annotations: {
-      read_only: booleanOrNull(annotations?.readOnly),
-      untrusted_content: booleanOrNull(annotations?.untrustedContent),
-      autosubmit: booleanOrNull(annotations?.autosubmit),
+      read_only: annotation("readOnly"),
+      untrusted_content: annotation("untrustedContent"),
+      ...(unknownConsequential ? {} : { consequential }),
+      autosubmit: annotation("autosubmit"),
     },
     registration_source: registrationSource(
       recordValue(value.stackTrace),
@@ -432,15 +495,6 @@ const normalizeTool = (
     ),
     trust: "page-declared-untrusted",
   };
-};
-
-const schemaShape = (value: unknown) => {
-  if (recordValue(value) === undefined) return null;
-  const encoded = JSON.stringify(value);
-  const shape = inferJsonShape(encoded);
-  if (shape === null)
-    throw new BrowserObservationError("inspect_web_page", "protocol_error");
-  return shape;
 };
 
 const registrationSource = (
@@ -489,7 +543,7 @@ const buildWebMcpResult = (options: WebMcpResultOptions): WebMcpDiscovery => {
     tools: {
       total: tools.size + completeness.droppedTotal,
       items: [...tools.values()].sort((left, right) =>
-        left.tool_key.localeCompare(right.tool_key),
+        compareUnicodeCodePoints(left.tool_key, right.tool_key),
       ),
     },
     completeness: completeness.snapshot(),
@@ -497,11 +551,13 @@ const buildWebMcpResult = (options: WebMcpResultOptions): WebMcpDiscovery => {
   };
 };
 
-const toolKey = (frameUrl: string, name: string): string =>
-  `webmcp_${createHash("sha256").update(`${frameUrl}\0${name}`).digest("hex")}`;
-
-const booleanOrNull = (value: unknown): boolean | null =>
-  typeof value === "boolean" ? value : null;
+const toolKey = (frameUrl: string, frameId: string, name: string): string =>
+  // Registrations without a known admitted frame are excluded above, so the
+  // frame ID here always distinguishes owners. Composite tuple keeps a NUL
+  // inside one field from collapsing two registrations before hashing.
+  `webmcp_${createHash("sha256")
+    .update(compositeKey([frameUrl, frameId, name]))
+    .digest("hex")}`;
 
 const integerOrNull = (value: unknown): number | null => {
   const number = numberValue(value);

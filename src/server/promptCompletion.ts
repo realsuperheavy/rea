@@ -1,19 +1,21 @@
+import type { EvidenceReader } from "../application/investigation/InvestigationRecordPort.js";
 import { z } from "zod";
 
 import { uniqueSorted } from "../domain/canonicalOrdering.js";
+import type { JsonValue } from "../domain/jsonValue.js";
 import type { AnalysisOperationPort } from "../application/AnalysisProvider.js";
-import type { BinarySessionPort } from "../application/BinarySession.js";
+import type { BinarySessionPort } from "../application/binary/BinarySessionPort.js";
 import type { PromptCompletionKind } from "../contracts/promptContracts.js";
-import { artifactInventoryResultSchema } from "../domain/artifactGraph.js";
-import { artifactInspectionResultSchema } from "../domain/artifactInspection.js";
-import { processCaptureSchema } from "../domain/processCapture.js";
+import { currentMcpRequestSignal } from "./EvidenceMcpServer.js";
+import { parseArtifactInventoryEvidence } from "../domain/artifactInventoryEvidence.js";
+import { EvidenceIntegrityError } from "../domain/evidenceErrors.js";
+import { parseProcessCapture } from "../domain/process/processCaptureParsing.js";
 
 const documentListSchema = z.array(z.string().min(1));
 const providerStatusSchema = z.object({
-  providers: z.array(z.object({ id: z.string().min(1) })),
-  analysis_provider_candidates: z
-    .array(z.object({ provider: z.object({ id: z.string().min(1) }) }))
-    .optional(),
+  analysis_provider_candidates: z.array(
+    z.object({ provider: z.object({ id: z.string().min(1) }) }),
+  ),
 });
 
 interface CompletionContext {
@@ -57,9 +59,13 @@ const completionCandidates = async (
 ): Promise<readonly string[]> => {
   switch (kind) {
     case "document":
-      return documentCandidates(analysis);
+      return documentCandidates(analysis, session);
     case "procedure":
-      return procedureCandidates(analysis, context?.arguments?.document);
+      return procedureCandidates(
+        analysis,
+        session,
+        context?.arguments?.document,
+      );
     case "provider":
       return providerCandidates(session);
     case "evidence":
@@ -74,8 +80,15 @@ const completionCandidates = async (
 
 const documentCandidates = async (
   analysis: AnalysisOperationPort,
+  session: BinarySessionPort | undefined,
 ): Promise<readonly string[]> => {
-  const result = await analysis.execute("list_documents", {});
+  const result = await completionInventoryLookup(
+    analysis,
+    session,
+    "list_documents",
+    {},
+  );
+  if (result === undefined) return [];
   if (!result.ok) return [];
   const parsed = documentListSchema.safeParse(result.value.result);
   return parsed.success ? parsed.data : [];
@@ -83,12 +96,19 @@ const documentCandidates = async (
 
 const procedureCandidates = async (
   analysis: AnalysisOperationPort,
+  session: BinarySessionPort | undefined,
   document: string | undefined,
 ): Promise<readonly string[]> => {
   const byAddress = new Map<string, string>();
   const input =
     document === undefined || document.length === 0 ? {} : { document };
-  const result = await analysis.execute("list_procedures", input);
+  const result = await completionInventoryLookup(
+    analysis,
+    session,
+    "list_procedures",
+    input,
+  );
+  if (result === undefined) return [];
   if (result.ok) {
     const parsed = z
       .array(z.object({ address: z.string(), value: z.string() }))
@@ -111,18 +131,30 @@ const procedureCandidates = async (
   return candidates;
 };
 
+const completionInventoryLookup = async (
+  analysis: AnalysisOperationPort,
+  session: BinarySessionPort | undefined,
+  operation: "list_documents" | "list_procedures",
+  parameters: Readonly<Record<string, JsonValue>>,
+) => {
+  const signal = currentMcpRequestSignal();
+  const options = signal === undefined ? {} : { signal };
+  const result =
+    session === undefined
+      ? await analysis.execute(operation, parameters, options)
+      : await session.executeIfProviderReady(operation, parameters, options);
+  return signal?.aborted === true ? undefined : result;
+};
+
 const providerCandidates = (
   session: BinarySessionPort | undefined,
 ): readonly string[] => {
   if (session === undefined) return [];
   const parsed = providerStatusSchema.safeParse(session.status());
   if (!parsed.success) return [];
-  const candidates =
-    (parsed.data.analysis_provider_candidates?.length ?? 0) > 0
-      ? (parsed.data.analysis_provider_candidates?.map(
-          ({ provider }) => provider.id,
-        ) ?? [])
-      : parsed.data.providers.map(({ id }) => id);
+  const candidates = parsed.data.analysis_provider_candidates.map(
+    ({ provider }) => provider.id,
+  );
   return ["auto", ...candidates];
 };
 
@@ -138,7 +170,7 @@ const evidenceCandidates = (
 };
 
 type LedgerEvidence = ReturnType<
-  BinarySessionPort["exportEvidenceBundle"]
+  EvidenceReader["exportEvidenceBundle"]
 >["records"][number];
 
 const evidenceValues = (
@@ -148,30 +180,43 @@ const evidenceValues = (
   if (kind === "evidence") return [evidence.evidence_id];
   if (kind === "capture")
     return isProcessCaptureEvidence(evidence) ? [evidence.evidence_id] : [];
-  const inventoryResult =
-    evidence.operation === "inventory_artifact"
-      ? evidence.normalized_result
-      : evidence.operation === "inspect_artifact"
-        ? (() => {
-            const inspection = artifactInspectionResultSchema.safeParse(
-              evidence.normalized_result,
-            );
-            return inspection.success
-              ? inspection.data.substeps[0]?.evidence.normalized_result
-              : undefined;
-          })()
-        : undefined;
-  if (inventoryResult === undefined) return [];
-  const inventory = artifactInventoryResultSchema.safeParse(inventoryResult);
-  if (!inventory.success) return [];
-  if (kind === "manifest") return [inventory.data.manifest.manifest_id];
-  return inventory.data.occurrences.map(({ occurrence_id: id }) => id);
+  if (
+    evidence.operation === "inventory_artifact" ||
+    evidence.operation === "inspect_artifact"
+  )
+    return artifactInventoryValues(kind, evidence);
+  return [];
+};
+
+const artifactInventoryValues = (
+  kind: "manifest" | "occurrence",
+  evidence: unknown,
+): readonly string[] => {
+  try {
+    const { inventory } = parseArtifactInventoryEvidence(evidence);
+    return kind === "manifest"
+      ? [inventory.manifest.manifest_id]
+      : inventory.occurrences.map(({ occurrence_id: id }) => id);
+  } catch (cause: unknown) {
+    if (
+      cause instanceof TypeError ||
+      cause instanceof z.ZodError ||
+      cause instanceof EvidenceIntegrityError
+    )
+      return [];
+    throw cause;
+  }
 };
 
 const isProcessCaptureEvidence = (evidence: LedgerEvidence): boolean => {
   if (evidence.operation !== "capture_process_scenario") return false;
-  const capture = processCaptureSchema.safeParse(evidence.normalized_result);
-  return capture.success;
+  try {
+    parseProcessCapture(evidence.normalized_result);
+    return true;
+  } catch (cause: unknown) {
+    if (cause instanceof TypeError || cause instanceof z.ZodError) return false;
+    throw cause;
+  }
 };
 
 const unknownCandidates = (

@@ -1,17 +1,26 @@
 import {
   inspectSignatureSchema,
   type InspectSignature,
-} from "../../domain/nativeInspection.js";
+} from "../../domain/native/nativeInspection.js";
 
-/** Parse bounded `codesign -d` diagnostics, which Apple emits on stderr. */
+/**
+ * Parse bounded `codesign -d --verbose=4` diagnostics, which Apple emits on
+ * stderr. codesign echoes the executable path and signing identifier
+ * verbatim, and an ad hoc identifier derives from the file name, so either
+ * can contain line breaks and text that resembles other fields. The path is
+ * removed by its exact value from `executablePaths`, and the identifier runs
+ * to the `Format=` field that codesign prints after it.
+ */
 export const parseCodeSignature = (
   output: string,
   unsigned: boolean,
+  executablePaths: readonly string[] = [],
 ): Omit<InspectSignature, "provenance"> => {
+  const { identifier, fields } = splitEchoedValues(output, executablePaths);
   const values = new Map<string, string>();
   const authorities: string[] = [];
   const cdhashes: string[] = [];
-  for (const line of output.split(/\r?\n/u)) {
+  for (const line of fields.split(/\r?\n/u)) {
     if (line.startsWith("CodeDirectory ")) {
       values.set("CodeDirectory", line.slice("CodeDirectory ".length));
       continue;
@@ -26,7 +35,7 @@ export const parseCodeSignature = (
   }
   const parsed = inspectSignatureSchema.omit({ provenance: true }).parse({
     signed: !unsigned,
-    identifier: values.get("Identifier") ?? null,
+    identifier: identifier ?? null,
     team_identifier: nullableCodeSignValue(values.get("TeamIdentifier")),
     format: values.get("Format") ?? null,
     cdhashes,
@@ -43,6 +52,53 @@ export const parseCodeSignature = (
         ],
   });
   return parsed;
+};
+
+/**
+ * Separate the echoed executable path and signing identifier, which codesign
+ * prints first, from the fields that follow them.
+ */
+const splitEchoedValues = (
+  text: string,
+  executablePaths: readonly string[],
+): { readonly identifier: string | undefined; readonly fields: string } => {
+  let rest = text;
+  // Frame the exact source path before interpreting record separators. A CRLF
+  // inside that path or the signing identifier is payload, not a line ending.
+  let newline: string | undefined;
+  for (const path of executablePaths) {
+    const prefix = `Executable=${path}`;
+    if (!text.startsWith(prefix)) continue;
+    const separator = /^\r?\n/u.exec(text.slice(prefix.length))?.[0];
+    if (separator === undefined) continue;
+    newline = separator;
+    rest = text.slice(prefix.length + separator.length);
+    break;
+  }
+  if (rest === text && text.startsWith("Executable=")) {
+    const identifierLine = text.indexOf("\nIdentifier=");
+    rest = identifierLine < 0 ? text : text.slice(identifierLine + 1);
+  }
+  if (!rest.startsWith("Identifier="))
+    return { identifier: undefined, fields: rest };
+  // Later fields come from the signature itself, so the last `Format=` line
+  // is the one codesign printed after the identifier.
+  const format = rest.lastIndexOf("\nFormat=");
+  // Without an exact path, use the producer-owned Format record's terminator.
+  // Looking inside Identifier instead would confuse literal CRLF payload with
+  // record framing, or strip a literal trailing CR from an LF-delimited value.
+  if (newline === undefined && format >= 0)
+    newline = /\r?\n/u.exec(rest.slice(format + 1))?.[0];
+  const boundary = format >= 0 ? format : rest.indexOf("\n");
+  const crlf = newline === undefined || newline === "\r\n";
+  const end =
+    boundary < 0
+      ? rest.length
+      : boundary - (crlf && rest[boundary - 1] === "\r" ? 1 : 0);
+  return {
+    identifier: rest.slice("Identifier=".length, end),
+    fields: rest.slice(end),
+  };
 };
 
 const nullableCodeSignValue = (value: string | undefined): string | null =>

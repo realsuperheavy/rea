@@ -1,4 +1,4 @@
-import type { ObjcSwiftMetadata } from "../domain/objcSwiftMetadata.js";
+import type { ObjcSwiftMetadata } from "../domain/native/objcSwiftMetadata.js";
 import type { SwiftMetadataReaders } from "./AppleSwiftVtables.js";
 
 /** Read protocol lists and absolute protocol method declarations with cycle-safe identities. */
@@ -6,7 +6,12 @@ export const createObjcProtocolReader = (input: {
   readers: Pick<
     SwiftMetadataReaders,
     "u32" | "string" | "location" | "evidence" | "admit"
-  > & { pointer(address: bigint): bigint; i32(address: bigint): number };
+  > & {
+    pointer(address: bigint): bigint;
+    /** Plain 64-bit data, never a fixup. */
+    u64(address: bigint): bigint;
+    i32(address: bigint): number;
+  };
   result: ObjcSwiftMetadata;
   failures: string[];
 }) => {
@@ -15,7 +20,8 @@ export const createObjcProtocolReader = (input: {
   const name = (address: bigint) => read.string(read.pointer(address + 8n));
   const list = (address: bigint): string[] => {
     if (address === 0n) return [];
-    const count = read.pointer(address);
+    // `count` is plain uintptr_t data, not a pointer fixup.
+    const count = read.u64(address);
     if (count > 20000n)
       throw new RangeError("Protocol list exceeds 20000 entries");
     const names: string[] = [];
@@ -61,7 +67,11 @@ export const createObjcProtocolReader = (input: {
       if (read.u32(address + 64n) < 72)
         throw new RangeError("Truncated Objective-C protocol declaration");
       const protocolName = name(address);
+      // Adopted protocols are independent declarations; decode them before
+      // rejecting a parent whose own name is empty.
       const adopted = list(read.pointer(address + 16n));
+      if (protocolName.length === 0)
+        throw new TypeError("Objective-C protocol has an empty name");
       const required = [
         ...methods(read.pointer(address + 24n), true, true),
         ...methods(read.pointer(address + 32n), true, false),

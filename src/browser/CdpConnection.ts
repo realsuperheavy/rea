@@ -3,8 +3,14 @@ import WebSocket, { type RawData } from "ws";
 import { AnalysisCancelledError } from "../domain/analysisErrorCore.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { BrowserObservationError } from "../domain/browserObservationError.js";
-import { type BrowserObservationOperation } from "../domain/browserObservationErrors.js";
+import { CdpCommandRejection } from "./CdpCommandRejection.js";
+import type { BrowserObservationOperation } from "../domain/browserObservationErrors.js";
 import { safeParseJson } from "../domain/safeJson.js";
+import { WEB_RUNTIME_LIMITS } from "../domain/webRuntime.js";
+
+// ws currently stores maxPayload as a signed 32-bit integer. Larger values can
+// wrap to a negative number, which disables its limit check.
+const MAX_WEBSOCKET_PAYLOAD_BYTES = 0x7fff_ffff;
 
 export interface CdpEvent {
   readonly method: string;
@@ -13,27 +19,43 @@ export interface CdpEvent {
 }
 
 interface PendingCommand {
+  readonly method: string;
+  readonly sessionId?: string;
   readonly resolve: (value: unknown) => void;
   readonly reject: (error: AnalysisError) => void;
-  readonly removeAbort: () => void;
+  readonly dispose: () => void;
 }
 
 /** Correlated JSON-RPC transport for one CDP target operation. */
 export class CdpConnection {
   readonly #pending = new Map<number, PendingCommand>();
   readonly #listeners = new Set<(event: CdpEvent) => void>();
-  readonly #disconnectListeners = new Set<() => void>();
+  readonly #disconnectListeners = new Set<
+    (error: BrowserObservationError) => void
+  >();
+  readonly #protocolFailureListeners = new Set<
+    (error: BrowserObservationError) => void
+  >();
   #nextId = 1;
   #closed = false;
+  #closePromise: Promise<void> | undefined;
   #protocolFailed = false;
+  #transportFailure: "disconnected" | "payload_limit" = "disconnected";
 
   private constructor(
     private readonly socket: WebSocket,
     private readonly operation: BrowserObservationOperation,
+    private readonly maxPayloadBytes: number,
   ) {
     socket.on("message", (data) => this.#receive(data));
     socket.on("close", () => this.#disconnect());
-    socket.on("error", () => this.#disconnect());
+    socket.on("error", (cause) =>
+      this.#disconnect(
+        isRecord(cause) && cause.code === "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"
+          ? "payload_limit"
+          : "disconnected",
+      ),
+    );
   }
 
   /** Connect to one already-validated loopback CDP WebSocket. */
@@ -41,15 +63,30 @@ export class CdpConnection {
     url: string,
     operation: BrowserObservationOperation,
     signal?: AbortSignal,
+    limits?: { readonly maxPayloadBytes: number },
   ): Promise<CdpConnection> {
     if (signal?.aborted === true) throw new AnalysisCancelledError(operation);
+    const maxPayloadBytes =
+      limits === undefined
+        ? WEB_RUNTIME_LIMITS.protocolBytes
+        : limits.maxPayloadBytes;
+    if (
+      !Number.isSafeInteger(maxPayloadBytes) ||
+      maxPayloadBytes <= 0 ||
+      maxPayloadBytes > MAX_WEBSOCKET_PAYLOAD_BYTES
+    )
+      throw new RangeError(
+        `CDP maxPayloadBytes must be a positive safe integer no greater than ${String(MAX_WEBSOCKET_PAYLOAD_BYTES)}.`,
+      );
     const socket = new WebSocket(url, {
+      // waitForOpen owns the deadline, cancellation, cleanup, and typed errors;
+      // keep ws's timer disabled so handshake failures have one owner.
       handshakeTimeout: 0,
-      maxPayload: 0,
+      maxPayload: maxPayloadBytes,
       perMessageDeflate: false,
     });
     await waitForOpen(socket, operation, signal);
-    return new CdpConnection(socket, operation);
+    return new CdpConnection(socket, operation, maxPayloadBytes);
   }
 
   /** Subscribe to validated CDP event envelopes. */
@@ -59,16 +96,28 @@ export class CdpConnection {
   }
 
   /** Subscribe to an unexpected transport loss while an operation is active. */
-  onDisconnect(listener: () => void): () => void {
+  onDisconnect(listener: (error: BrowserObservationError) => void): () => void {
     if (this.#closed) {
-      listener();
+      listener(this.#transportError(this.#transportFailure));
       return () => undefined;
     }
     this.#disconnectListeners.add(listener);
     return () => this.#disconnectListeners.delete(listener);
   }
 
-  /** Execute one command, optionally within a flat target session. */
+  /** Notify fatal wire parsing failure even when no command is outstanding. */
+  onProtocolFailure(
+    listener: (error: BrowserObservationError) => void,
+  ): () => void {
+    if (this.#protocolFailed) {
+      listener(this.#transportError("protocol_error"));
+      return () => undefined;
+    }
+    this.#protocolFailureListeners.add(listener);
+    return () => this.#protocolFailureListeners.delete(listener);
+  }
+
+  /** Bound each response separately from the caller-selected observation window. */
   async send(
     method: string,
     params: Readonly<Record<string, unknown>> = {},
@@ -78,50 +127,69 @@ export class CdpConnection {
     if (this.#protocolFailed)
       throw new BrowserObservationError(this.operation, "protocol_error");
     if (this.#closed || this.socket.readyState !== WebSocket.OPEN)
-      throw new BrowserObservationError(this.operation, "disconnected");
+      throw this.#transportError(this.#transportFailure);
     if (signal?.aborted === true)
       throw new AnalysisCancelledError(this.operation);
     const id = this.#nextId;
     this.#nextId += 1;
+    const message = JSON.stringify({
+      id,
+      method,
+      params,
+      ...(sessionId === undefined ? {} : { sessionId }),
+    });
     return await new Promise((resolve, reject) => {
       const onAbort = (): void => {
         const pending = this.#pending.get(id);
         if (pending === undefined) return;
-        pending.removeAbort();
-        this.#pending.delete(id);
+        this.#complete(id, pending);
         reject(new AnalysisCancelledError(this.operation));
       };
+      const timer = setTimeout(() => {
+        const pending = this.#pending.get(id);
+        if (pending === undefined) return;
+        this.#complete(id, pending);
+        reject(
+          new BrowserObservationError(this.operation, "timeout", {
+            detail: `CDP command ${method} exceeded its ${String(WEB_RUNTIME_LIMITS.commandTimeoutMs)} ms response deadline.`,
+          }),
+        );
+      }, WEB_RUNTIME_LIMITS.commandTimeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
       this.#pending.set(id, {
+        method,
+        ...(sessionId === undefined ? {} : { sessionId }),
         resolve,
         reject,
-        removeAbort: () => signal?.removeEventListener("abort", onAbort),
-      });
-      this.socket.send(
-        JSON.stringify({
-          id,
-          method,
-          params,
-          ...(sessionId === undefined ? {} : { sessionId }),
-        }),
-        (error) => {
-          if (error === undefined || error === null) return;
-          const pending = this.#pending.get(id);
-          if (pending === undefined) return;
-          this.#complete(id, pending);
-          reject(
-            new BrowserObservationError(this.operation, "disconnected", {
-              cause: error,
-            }),
-          );
+        dispose: () => {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
         },
-      );
+      });
+      this.socket.send(message, (error) => {
+        if (error === undefined || error === null) return;
+        const pending = this.#pending.get(id);
+        if (pending === undefined) return;
+        this.#complete(id, pending);
+        reject(
+          new BrowserObservationError(this.operation, "disconnected", {
+            cause: error,
+          }),
+        );
+      });
     });
   }
 
   /** Close only REA's socket; never close the browser or selected page. */
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    this.#closePromise ??= this.#closeTransport().catch((cause: unknown) => {
+      this.#closePromise = undefined;
+      throw cause;
+    });
+    return this.#closePromise;
+  }
+
+  async #closeTransport(): Promise<void> {
     this.#closed = true;
     this.#failPending("disconnected");
     if (this.socket.readyState === WebSocket.CLOSED) return;
@@ -139,6 +207,7 @@ export class CdpConnection {
   }
 
   #receive(data: RawData): void {
+    if (this.#closed || this.#protocolFailed) return;
     const parsed = safeParseJson(rawText(data));
     if (!parsed.ok) {
       this.#failPending("protocol_error");
@@ -183,36 +252,101 @@ export class CdpConnection {
   #receiveResponse(message: Record<string, unknown>, id: number): void {
     const pending = this.#pending.get(id);
     if (pending === undefined) return;
-    this.#complete(id, pending);
-    if ("error" in message) {
-      pending.reject(
-        new BrowserObservationError(this.operation, "protocol_error"),
-      );
+    const hasResult = "result" in message;
+    const hasError = "error" in message;
+    // Chromium cannot route a rejection through a flat session after that
+    // session disappears. Its browser-level reply omits sessionId, but the
+    // connection-global command id still binds this exact terminal error.
+    const detachedSessionError =
+      pending.sessionId !== undefined &&
+      !("sessionId" in message) &&
+      hasError &&
+      isRecord(message.error) &&
+      message.error.code === -32_001 &&
+      message.error.message === "Session with given id not found.";
+    if (
+      (pending.sessionId === undefined
+        ? "sessionId" in message
+        : message.sessionId !== pending.sessionId && !detachedSessionError) ||
+      hasResult === hasError
+    ) {
+      this.#failPending("protocol_error");
       return;
     }
-    pending.resolve("result" in message ? message.result : {});
+    if (hasResult) {
+      if (!isRecord(message.result)) {
+        this.#failPending("protocol_error");
+        return;
+      }
+      this.#complete(id, pending);
+      pending.resolve(message.result);
+      return;
+    }
+    const reported = message.error;
+    if (
+      !isRecord(reported) ||
+      typeof reported.code !== "number" ||
+      !Number.isSafeInteger(reported.code) ||
+      typeof reported.message !== "string"
+    ) {
+      this.#failPending("protocol_error");
+      return;
+    }
+    this.#complete(id, pending);
+    pending.reject(
+      new CdpCommandRejection(
+        this.operation,
+        pending.method,
+        reported.code,
+        reported.message,
+      ),
+    );
   }
 
   #complete(id: number, pending: PendingCommand): void {
-    pending.removeAbort();
+    pending.dispose();
     this.#pending.delete(id);
   }
 
-  #failPending(reason: "disconnected" | "protocol_error"): void {
-    if (reason === "disconnected") this.#closed = true;
+  #failPending(
+    reason: "disconnected" | "protocol_error" | "payload_limit",
+  ): void {
+    const wasProtocolFailed = this.#protocolFailed;
+    if (reason !== "protocol_error") this.#closed = true;
     else this.#protocolFailed = true;
     for (const [id, pending] of this.#pending) {
       this.#complete(id, pending);
-      pending.reject(new BrowserObservationError(this.operation, reason));
+      pending.reject(this.#transportError(reason));
+    }
+    if (reason === "protocol_error" && !wasProtocolFailed) {
+      const error = this.#transportError(reason);
+      for (const listener of this.#protocolFailureListeners) listener(error);
+      this.#protocolFailureListeners.clear();
     }
   }
 
-  #disconnect(): void {
+  #disconnect(reason: "disconnected" | "payload_limit" = "disconnected"): void {
     const wasClosed = this.#closed;
-    this.#failPending("disconnected");
+    if (!wasClosed) this.#transportFailure = reason;
+    this.#failPending(reason);
     if (wasClosed) return;
-    for (const listener of this.#disconnectListeners) listener();
+    const error = this.#transportError(reason);
+    for (const listener of this.#disconnectListeners) listener(error);
     this.#disconnectListeners.clear();
+  }
+
+  #transportError(
+    reason: "disconnected" | "protocol_error" | "payload_limit",
+  ): BrowserObservationError {
+    return new BrowserObservationError(
+      this.operation,
+      reason,
+      reason === "payload_limit"
+        ? {
+            detail: `CDP message exceeded the selected ${String(this.maxPayloadBytes)} byte protocol budget.`,
+          }
+        : undefined,
+    );
   }
 }
 
@@ -258,11 +392,21 @@ const waitForOpen = async (
       onFailure(new AnalysisCancelledError(operation));
     };
     const cleanup = (): void => {
+      clearTimeout(timer);
       socket.off("open", onOpen);
       socket.off("error", onFailure);
       socket.off("close", onClose);
       signal?.removeEventListener("abort", onAbort);
     };
+    const timer = setTimeout(() => {
+      terminateSocket(socket);
+      cleanup();
+      reject(
+        new BrowserObservationError(operation, "timeout", {
+          detail: `CDP WebSocket handshake exceeded its ${String(WEB_RUNTIME_LIMITS.commandTimeoutMs)} ms deadline.`,
+        }),
+      );
+    }, WEB_RUNTIME_LIMITS.commandTimeoutMs);
     socket.once("open", onOpen);
     socket.once("error", onFailure);
     socket.once("close", onClose);

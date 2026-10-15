@@ -1,10 +1,6 @@
-import type { WebPageInspection } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
-import {
-  numberValue,
-  stringValue,
-  type UnknownRecord,
-} from "./CdpCaptureValues.js";
+import { cdpStringValue, type UnknownRecord } from "./CdpCaptureValues.js";
 
 type ResponseMetadata = WebPageInspection["metadata"]["responses"][number];
 type LinkMetadata = ResponseMetadata["links"][number];
@@ -42,8 +38,8 @@ export const safeResponseMetadata = (
     response: {
       request_id: requestId,
       url,
-      mime_type: boundedHeader(stringValue(response.mimeType)),
-      content_length: nonnegativeInteger(headers.get("content-length")),
+      mime_type: boundedHeader(cdpStringValue(response.mimeType)),
+      content_length: contentLength(headers.get("content-length")),
       content_encoding: boundedHeader(headers.get("content-encoding")),
       csp,
       links,
@@ -51,7 +47,7 @@ export const safeResponseMetadata = (
         coop: policyToken(headers.get("cross-origin-opener-policy")),
         coep: policyToken(headers.get("cross-origin-embedder-policy")),
         corp: policyToken(headers.get("cross-origin-resource-policy")),
-        referrer_policy: policyToken(headers.get("referrer-policy")),
+        referrer_policy: referrerPolicy(headers.get("referrer-policy")),
         x_content_type_options: policyToken(
           headers.get("x-content-type-options"),
         ),
@@ -92,7 +88,7 @@ const parseCsp = (
   for (const rawDirective of (value ?? "").split(";")) {
     const [rawName, ...tokens] = rawDirective.trim().split(/\s+/u);
     const name = (rawName ?? "").toLowerCase();
-    if (!/^[a-z][a-z0-9-]*$/u.test(name)) continue;
+    if (!/^[a-z][a-z0-9\x2d]*$/u.test(name)) continue;
     const sources: ResponseMetadata["csp"]["directives"][number]["sources"] =
       [];
     for (const token of tokens) {
@@ -122,8 +118,9 @@ const cspSource = (
   allowedOrigins: ReadonlySet<string>,
 ): ResponseMetadata["csp"]["directives"][number]["sources"][number] => {
   const lower = token.toLowerCase();
-  if (/^'[a-z0-9-]+'$/u.test(lower)) return { kind: "keyword", value: lower };
-  if (/^[a-z][a-z0-9+.-]*:$/u.test(lower))
+  if (/^'[a-z0-9\x2d]+'$/u.test(lower))
+    return { kind: "keyword", value: lower };
+  if (/^[a-z][a-z0-9+.\x2d]*:$/u.test(lower))
     return { kind: "scheme", value: lower };
   const hostOrigin = cspHostSourceOrigin(token, baseUrl);
   if (hostOrigin === undefined) return { kind: "other", value: null };
@@ -143,16 +140,15 @@ const cspHostSourceOrigin = (
   token: string,
   baseUrl: string,
 ): string | null | undefined => {
-  const match = /^(?:([a-z][a-z0-9+.-]*):\/\/)?([^/?#]+)(?:\/[^?#]*)?$/iu.exec(
-    token,
-  );
+  const match =
+    /^(?:([a-z][a-z0-9+.\x2d]*):\/\/)?([^\x2f?#]+)(?:\/[^?#]*)?$/iu.exec(token);
   const authority = match?.[2];
   if (authority === undefined || authority.length === 0) return undefined;
   const scheme = (match?.[1] ?? schemeOf(baseUrl))?.toLowerCase();
-  if (scheme === undefined || !/^[a-z][a-z0-9+.-]*$/u.test(scheme))
+  if (scheme === undefined || !/^[a-z][a-z0-9+.\x2d]*$/u.test(scheme))
     return undefined;
   if (
-    !/^(?:\*|(?:\*\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.?)(?::(?:\*|\d+))?$/iu.test(
+    !/^(?:\*|(?:\*\.)?[a-z0-9\x2d]+(?:\.[a-z0-9\x2d]+)*\.?)(?::(?:\*|\d+))?$/iu.test(
       authority,
     )
   )
@@ -213,16 +209,30 @@ const parseLinks = (
   return links;
 };
 
-const splitLinkHeader = (value: string): string[] => {
+const splitLinkHeader = (
+  value: string,
+  delimiter: "," | ";" = ",",
+): string[] => {
   const entries: string[] = [];
   let start = 0;
   let quoted = false;
+  let escaped = false;
+  let target = false;
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index];
-    if (character === '"' && value[index - 1] !== "\\") quoted = !quoted;
-    if (character !== "," || quoted) continue;
-    entries.push(value.slice(start, index));
-    start = index + 1;
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === '"') quoted = false;
+      continue;
+    }
+    if (character === '"' && !target) quoted = true;
+    else if (delimiter === "," && character === "<") target = true;
+    else if (delimiter === "," && character === ">") target = false;
+    else if (character === delimiter && !target) {
+      entries.push(value.slice(start, index));
+      start = index + 1;
+    }
   }
   entries.push(value.slice(start));
   return entries;
@@ -230,12 +240,12 @@ const splitLinkHeader = (value: string): string[] => {
 
 const linkParameters = (value: string): ReadonlyMap<string, string> => {
   const parameters = new Map<string, string>();
-  for (const raw of value.split(";").slice(1)) {
+  for (const raw of splitLinkHeader(value, ";").slice(1)) {
     const separator = raw.indexOf("=");
     const name = (separator < 0 ? raw : raw.slice(0, separator))
       .trim()
       .toLowerCase();
-    if (!/^[a-z][a-z0-9-]*$/u.test(name)) continue;
+    if (!/^[a-z][a-z0-9\x2d]*$/u.test(name)) continue;
     const parameter = separator < 0 ? "" : raw.slice(separator + 1).trim();
     parameters.set(name, unquote(parameter));
   }
@@ -271,7 +281,7 @@ const permissionFeatures = (value: string | undefined): string[] =>
       (value ?? "")
         .split(",")
         .map((entry) => entry.split("=", 1)[0]?.trim().toLowerCase() ?? "")
-        .filter((feature) => /^[a-z][a-z0-9-]*$/u.test(feature)),
+        .filter((feature) => /^[a-z][a-z0-9\x2d]*$/u.test(feature)),
     ),
   ].sort();
 
@@ -302,14 +312,39 @@ const agentHint = (
 const isAgentRel = (value: string): boolean =>
   ["mcp", "model-context", "ai-plugin", "service-desc"].includes(value);
 
-const policyToken = (value: string | undefined): string | null => {
-  const token = (value ?? "").trim().toLowerCase();
-  return /^[a-z][a-z0-9_.-]*$/u.test(token) ? token : null;
+const referrerPolicies = new Set([
+  "no-referrer",
+  "no-referrer-when-downgrade",
+  "same-origin",
+  "origin",
+  "strict-origin",
+  "origin-when-cross-origin",
+  "strict-origin-when-cross-origin",
+  "unsafe-url",
+]);
+
+const referrerPolicy = (value: string | undefined): string | null => {
+  let policy: string | null = null;
+  for (const raw of (value ?? "").split(",")) {
+    const token = raw.trim().toLowerCase();
+    if (token === "") continue;
+    if (!/^[a-z\x2d]+$/u.test(token)) return null;
+    if (referrerPolicies.has(token)) policy = token;
+  }
+  return policy;
 };
 
-const nonnegativeInteger = (value: string | undefined): number | null => {
-  const number = numberValue(value === undefined ? undefined : Number(value));
-  return number === undefined ? null : Math.max(0, Math.trunc(number));
+const policyToken = (value: string | undefined): string | null => {
+  const token = (value ?? "").trim().toLowerCase();
+  return /^[a-z][a-z0-9_.\x2d]*$/u.test(token) ? token : null;
+};
+
+// RFC 9110 section 8.6: Content-Length = 1*DIGIT. Other spellings declare no length.
+const contentLength = (value: string | undefined): number | null => {
+  const token = (value ?? "").trim();
+  if (!/^[0-9]+$/u.test(token)) return null;
+  const length = Number(token);
+  return Number.isSafeInteger(length) ? length : null;
 };
 
 const boundedHeader = (value: string | undefined): string | null =>

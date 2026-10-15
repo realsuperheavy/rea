@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect or activate Hopper's version-pinned demo dialog on a private X display."""
+"""Inspect or activate Hopper's authenticated demo dialog on a private X display."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import secrets
+import select
 import stat
 import subprocess
 import tempfile
@@ -17,14 +19,11 @@ import threading
 import time
 
 
-# Keep this digest aligned with LinuxHopper.ts and rerun real-Hopper verification
-# before accepting another vendor build.
-SUPPORTED_HOPPER_SHA256 = {
-    "0294ced141cc373468ee22d8343e7dac41980cb05a937994ca81c9f09afe7ded"
-}
 EXPECTED_SCREEN = (1280, 1024)
-EXPECTED_DIALOG = (189, 370, 901, 284)
-DEMO_CLICK = (305, 632)
+DIALOG_TITLES = {"Registration", "Registration — Hopper Disassembler"}
+HOPPER_WINDOW_TITLE = "Hopper Disassembler"
+DEMO_CLICK_LEFT = 116
+DEMO_CLICK_BOTTOM = 22
 PRIVATE_DISPLAY_UNAVAILABLE = 70
 X11_AUTHORIZATION_FAILED = 71
 UNSUPPORTED_HOPPER_BUILD = 72
@@ -115,7 +114,9 @@ class XWindowAttributes(ctypes.Structure):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe", action="store_true")
+    parser.add_argument("--owner-stdin", action="store_true")
     parser.add_argument("--hopper")
+    parser.add_argument("--expected-launcher-sha256")
     parser.add_argument("--socket")
     parser.add_argument(
         "--strategy",
@@ -128,6 +129,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-number", type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser.parse_args()
+
+
+class OwnerLifetime:
+    """The launcher's private pipe is a lifetime capability, independent of PIDs."""
+
+    def __init__(self, enabled: bool) -> None:
+        self._poll = select.poll() if enabled else None
+        if self._poll is not None:
+            # Node/libuv can implement piped stdio with a Unix socket pair.
+            mode = os.fstat(0).st_mode
+            if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+                raise AdapterFailure(
+                    INVALID_LAUNCH_COMMAND,
+                    "invalid_launch_command",
+                    "owner lifetime requires a private stdin pipe",
+                )
+            self._poll.register(0, select.POLLIN | select.POLLHUP | select.POLLERR)
+
+    def alive(self) -> bool:
+        if self._poll is None:
+            return True
+        for _, events in self._poll.poll(0):
+            if events & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                return False
+            if events & select.POLLIN and not os.read(0, 4096):
+                return False
+        return True
+
+
+def wait_for_hopper(child: subprocess.Popen[bytes], owner: OwnerLifetime) -> int:
+    while owner.alive():
+        try:
+            return child.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+    # run_launch's finally owns cleanup of both direct, unreaped children.
+    return 0
 
 
 def digest(path: Path) -> str:
@@ -196,6 +234,47 @@ def windows(x11: ctypes.CDLL, display: int, root: int) -> list[tuple[int, int, i
     return found
 
 
+def window_title(x11: ctypes.CDLL, display: int, window: int) -> str | None:
+    title = ctypes.c_char_p()
+    if not x11.XFetchName(display, window, ctypes.byref(title)) or not title.value:
+        return None
+    try:
+        return title.value.decode("utf-8", "replace")
+    finally:
+        x11.XFree(ctypes.cast(title, ctypes.c_void_p))
+
+
+def window_transient_for(
+    x11: ctypes.CDLL, display: int, window: int
+) -> int | None:
+    parent = ctypes.c_ulong()
+    if not x11.XGetTransientForHint(display, window, ctypes.byref(parent)):
+        return None
+    return int(parent.value)
+
+
+def find_demo_dialog(
+    x11: ctypes.CDLL,
+    display: int,
+    observed: list[tuple[int, int, int, int, int]],
+) -> tuple[int, int, int, int, int] | None:
+    for candidate in observed:
+        window = candidate[0]
+        if window_title(x11, display, window) not in DIALOG_TITLES:
+            continue
+        parent = window_transient_for(x11, display, window)
+        if parent is None:
+            continue
+        if window_title(x11, display, parent) == HOPPER_WINDOW_TITLE:
+            return candidate
+    return None
+
+
+def demo_click(dialog: tuple[int, int, int, int, int]) -> tuple[int, int]:
+    _window, x, y, _width, height = dialog
+    return x + DEMO_CLICK_LEFT, y + height - DEMO_CLICK_BOTTOM
+
+
 def configure_x11(x11: ctypes.CDLL, xtst: ctypes.CDLL) -> None:
     window_pointer = ctypes.POINTER(ctypes.c_ulong)
     x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -212,6 +291,18 @@ def configure_x11(x11: ctypes.CDLL, xtst: ctypes.CDLL) -> None:
         ctypes.POINTER(XWindowAttributes),
     ]
     x11.XGetWindowAttributes.restype = ctypes.c_int
+    x11.XFetchName.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_char_p),
+    ]
+    x11.XFetchName.restype = ctypes.c_int
+    x11.XGetTransientForHint.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+    ]
+    x11.XGetTransientForHint.restype = ctypes.c_int
     x11.XQueryTree.argtypes = [
         ctypes.c_void_p,
         ctypes.c_ulong,
@@ -516,6 +607,7 @@ def start_xvfb(
                     "-auth",
                     str(authority),
                 ],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
@@ -565,16 +657,25 @@ def run_probe(args: argparse.Namespace) -> dict[str, object]:
 
 
 def run_launch(args: argparse.Namespace) -> int:
-    if args.hopper is None or args.socket is None:
+    if (
+        args.hopper is None or args.socket is None
+        or args.expected_launcher_sha256 is None
+        or re.fullmatch(r"[a-f0-9]{64}", args.expected_launcher_sha256) is None
+    ):
         raise AdapterFailure(
             INVALID_LAUNCH_COMMAND,
             "invalid_launch_command",
             "missing Hopper launch coordinates",
         )
+    owner = OwnerLifetime(args.owner_stdin)
+    if not owner.alive():
+        return 0
     hopper = Path(args.hopper)
     socket = Path(args.socket)
     try:
-        supported = digest(hopper) in SUPPORTED_HOPPER_SHA256
+        # The parent owns publisher/package interpretation. Recheck its admitted
+        # launcher bytes immediately before execution, preserving all X11 guards.
+        supported = digest(hopper) == args.expected_launcher_sha256
     except OSError as error:
         raise AdapterFailure(
             INVALID_LAUNCH_COMMAND,
@@ -585,7 +686,7 @@ def run_launch(args: argparse.Namespace) -> int:
         raise AdapterFailure(
             UNSUPPORTED_HOPPER_BUILD,
             "unsupported_hopper_build",
-            "unsupported Hopper binary",
+            "Hopper binary differs from the authenticated release",
         )
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command or Path(command[0]).resolve() != hopper.resolve():
@@ -598,6 +699,8 @@ def run_launch(args: argparse.Namespace) -> int:
     child: subprocess.Popen[bytes] | None = None
     display: int | None = None
     try:
+        if not owner.alive():
+            return 0
         hopper_environment = dict(os.environ)
         for name in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET"):
             hopper_environment.pop(name, None)
@@ -610,7 +713,10 @@ def run_launch(args: argparse.Namespace) -> int:
                 "XDG_SESSION_TYPE": "x11",
             }
         )
-        child = subprocess.Popen(command, env=hopper_environment)
+        # Children must not consume or retain REA's lifetime pipe.
+        child = subprocess.Popen(
+            command, env=hopper_environment, stdin=subprocess.DEVNULL
+        )
         leader = os.getpid()
         os.environ["XAUTHORITY"] = str(authority)
 
@@ -644,11 +750,14 @@ def run_launch(args: argparse.Namespace) -> int:
 
         deadline = time.monotonic() + 10
         observed: list[tuple[int, int, int, int, int]] = []
+        dialog: tuple[int, int, int, int, int] | None = None
         while time.monotonic() < deadline:
+            if not owner.alive():
+                return 0
             if socket.exists():
                 x11.XCloseDisplay(display)
                 display = None
-                return child.wait()
+                return wait_for_hopper(child, owner)
             if not hopper_is_owned(leader, hopper):
                 if child.poll() is None:
                     time.sleep(0.1)
@@ -659,7 +768,8 @@ def run_launch(args: argparse.Namespace) -> int:
                     "owned Hopper process exited",
                 )
             observed = windows(x11, display, root)
-            if any(window[1:] == EXPECTED_DIALOG for window in observed):
+            dialog = find_demo_dialog(x11, display, observed)
+            if dialog is not None:
                 break
             time.sleep(0.1)
         else:
@@ -675,8 +785,10 @@ def run_launch(args: argparse.Namespace) -> int:
                 "expected Hopper demo dialog not found",
             )
 
+        assert dialog is not None
+        click_x, click_y = demo_click(dialog)
         input_results = (
-            xtst.XTestFakeMotionEvent(display, -1, DEMO_CLICK[0], DEMO_CLICK[1], 0),
+            xtst.XTestFakeMotionEvent(display, -1, click_x, click_y, 0),
             xtst.XTestFakeButtonEvent(display, 1, True, 0),
             xtst.XTestFakeButtonEvent(display, 1, False, 0),
         )
@@ -689,15 +801,14 @@ def run_launch(args: argparse.Namespace) -> int:
         x11.XFlush(display)
         x11.XCloseDisplay(display)
         display = None
-        return child.wait()
+        return wait_for_hopper(child, owner)
     except AdapterFailure as error:
         raise error.with_stderr(capture)
     finally:
         if display is not None:
             x11.XCloseDisplay(display)
-        if child is not None and child.poll() is None:
-            child.terminate()
-            child.wait()
+        if child is not None:
+            stop_process(child)
         stop_process(xvfb)
         capture.close()
 

@@ -2,14 +2,16 @@ import { createHash } from "node:crypto";
 
 import canonicalize from "canonicalize";
 
-import type {
-  InspectWebPageInput,
-  WebPageInspection,
-} from "../domain/browserObservation.js";
-import { compareCodePoints } from "../domain/canonicalOrdering.js";
+import type { InspectWebPageInput } from "../domain/browserObservation.js";
+import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 import { CdpConnection } from "./CdpConnection.js";
 import { optionalCdpCommand } from "./CdpOptionalCommand.js";
-import { recordValue, recordsValue, stringValue } from "./CdpCaptureValues.js";
+import {
+  recordValue,
+  recordsValue,
+  cdpStringValue,
+} from "./CdpCaptureValues.js";
 
 type StorageFingerprint =
   WebPageInspection["storage"]["content_fingerprints"][number];
@@ -48,6 +50,7 @@ interface FingerprintRun {
 interface CaptureStorageFingerprintInput {
   readonly context: StorageFingerprintContext;
   readonly origin: string;
+  readonly cookieUrl: string;
   readonly local: CapturedStorageItems;
   readonly session: CapturedStorageItems;
   readonly indexedDbNames: readonly string[];
@@ -64,6 +67,7 @@ type StorageFingerprintCapture = {
 export const captureStorageFingerprints = async ({
   context,
   origin,
+  cookieUrl,
   local,
   session,
   indexedDbNames,
@@ -77,11 +81,11 @@ export const captureStorageFingerprints = async ({
   const run = { context, limitations, state };
   addStorageItems(state, "local_storage", local.items);
   addStorageItems(state, "session_storage", session.items);
-  await addCookies(run, origin);
+  await addCookies(run, cookieUrl);
   await addIndexedDb(run, origin, indexedDbNames);
   await addCaches(run, caches);
   state.items.sort((left, right) =>
-    compareCodePoints(
+    compareUnicodeCodePoints(
       `${left.scope}:${left.identity_sha256}`,
       `${right.scope}:${right.identity_sha256}`,
     ),
@@ -107,12 +111,15 @@ const addStorageItems = (
 
 const addCookies = async (
   run: FingerprintRun,
-  origin: string,
+  pageUrl: string,
 ): Promise<void> => {
+  run.limitations.push(
+    "Cookie fingerprints cover cookies applicable to the current main-frame URL, not every path on its origin.",
+  );
   const raw = await optionalCdpCommand(
     run.context,
     "Network.getCookies",
-    { urls: [origin] },
+    { urls: [pageUrl] },
     run.limitations,
   );
   if (raw === undefined) {
@@ -127,10 +134,10 @@ const addCookies = async (
   const cookies = recordsValue(cookieValues);
   if (cookies.length !== cookieValues.length) run.state.complete = false;
   for (const cookie of cookies) {
-    const name = stringValue(cookie.name);
-    const value = stringValue(cookie.value);
-    const domain = stringValue(cookie.domain);
-    const path = stringValue(cookie.path);
+    const name = cdpStringValue(cookie.name);
+    const value = cdpStringValue(cookie.value);
+    const domain = cdpStringValue(cookie.domain);
+    const path = cdpStringValue(cookie.path);
     if (
       name === undefined ||
       value === undefined ||
@@ -171,7 +178,7 @@ const addIndexedDb = async (
       run.state.complete = false;
       continue;
     }
-    if (stringValue(database.name) !== databaseName) {
+    if (cdpStringValue(database.name) !== databaseName) {
       run.state.complete = false;
       continue;
     }
@@ -186,10 +193,12 @@ const addIndexedDb = async (
       scope: "indexed_db_schema",
       identity: databaseName,
       value: stores.map(indexedDbStoreSchema),
-      complete: indexedDbSchemaComplete(stores),
+      complete:
+        stores.length === database.objectStores.length &&
+        indexedDbSchemaComplete(stores),
     });
     for (const store of stores) {
-      const objectStoreName = stringValue(store.name);
+      const objectStoreName = cdpStringValue(store.name);
       if (objectStoreName === undefined) {
         run.state.complete = false;
         continue;
@@ -204,11 +213,11 @@ const addIndexedDb = async (
 };
 
 const indexedDbStoreSchema = (store: Readonly<Record<string, unknown>>) => ({
-  name: stringValue(store.name) ?? null,
+  name: cdpStringValue(store.name) ?? null,
   key_path: stableValue(store.keyPath),
   auto_increment: store.autoIncrement === true,
   indexes: recordsValue(store.indexes).map((index) => ({
-    name: stringValue(index.name) ?? null,
+    name: cdpStringValue(index.name) ?? null,
     key_path: stableValue(index.keyPath),
     unique: index.unique === true,
     multi_entry: index.multiEntry === true,
@@ -220,19 +229,37 @@ const indexedDbSchemaComplete = (
 ): boolean =>
   stores.every(
     (store) =>
-      stringValue(store.name) !== undefined &&
-      stableValueComplete(store.keyPath) &&
+      cdpStringValue(store.name) !== undefined &&
+      indexedDbKeyPathComplete(store.keyPath) &&
       typeof store.autoIncrement === "boolean" &&
       Array.isArray(store.indexes) &&
       recordsValue(store.indexes).length === store.indexes.length &&
       recordsValue(store.indexes).every(
         (index) =>
-          stringValue(index.name) !== undefined &&
-          stableValueComplete(index.keyPath) &&
+          cdpStringValue(index.name) !== undefined &&
+          indexedDbKeyPathComplete(index.keyPath) &&
           typeof index.unique === "boolean" &&
           typeof index.multiEntry === "boolean",
       ),
   );
+
+const indexedDbKeyPathComplete = (value: unknown): boolean => {
+  const keyPath = recordValue(value);
+  if (keyPath === undefined) return false;
+  switch (keyPath.type) {
+    case "null":
+      return true;
+    case "string":
+      return typeof keyPath.string === "string";
+    case "array":
+      return (
+        Array.isArray(keyPath.array) &&
+        keyPath.array.every((key) => typeof key === "string")
+      );
+    default:
+      return false;
+  }
+};
 
 const addIndexedDbRecords = async (
   run: FingerprintRun,
@@ -251,7 +278,6 @@ const addIndexedDbRecords = async (
         securityOrigin: input.origin,
         databaseName: input.databaseName,
         objectStoreName: input.objectStoreName,
-        indexName: "",
         skipCount,
         pageSize: STORAGE_ENTRY_PAGE_SIZE,
       },
@@ -275,7 +301,10 @@ const addIndexedDbRecords = async (
     for (const entry of entries) {
       const key = stableValue(entry.key);
       const primaryKey = stableValue(entry.primaryKey);
-      const value = stableValue(entry.value);
+      // A missing remote object is an omission, not the JavaScript value
+      // "undefined". Keep the unavailable digest null and coverage partial.
+      const value =
+        entry.value === undefined ? undefined : stableValue(entry.value);
       addFingerprint(run.state, {
         scope: "indexed_db_record",
         identity: {
@@ -285,7 +314,10 @@ const addIndexedDbRecords = async (
           primaryKey,
         },
         value,
-        complete: remoteObjectComplete(entry.value),
+        complete:
+          remoteObjectComplete(entry.key) &&
+          remoteObjectComplete(entry.primaryKey) &&
+          remoteObjectComplete(entry.value),
       });
     }
     if (result.hasMore !== true) return;
@@ -351,8 +383,8 @@ const addCacheEntry = async (
   cache: CapturedCache,
   entry: Readonly<Record<string, unknown>>,
 ): Promise<void> => {
-  const requestURL = stringValue(entry.requestURL);
-  const requestMethod = stringValue(entry.requestMethod);
+  const requestURL = cdpStringValue(entry.requestURL);
+  const requestMethod = cdpStringValue(entry.requestMethod);
   if (requestURL === undefined || requestMethod === undefined) {
     run.state.complete = false;
     return;
@@ -363,8 +395,8 @@ const addCacheEntry = async (
   }
   const headerRecords = recordsValue(entry.requestHeaders);
   const requestHeaders = headerRecords.flatMap((header) => {
-    const name = stringValue(header.name);
-    const value = stringValue(header.value);
+    const name = cdpStringValue(header.name);
+    const value = cdpStringValue(header.value);
     return name === undefined || value === undefined ? [] : [{ name, value }];
   });
   if (
@@ -380,7 +412,7 @@ const addCacheEntry = async (
     { cacheId: cache.id, requestURL, requestHeaders },
     run.limitations,
   );
-  const body = stringValue(recordValue(recordValue(raw)?.response)?.body);
+  const body = cdpStringValue(recordValue(recordValue(raw)?.response)?.body);
   const decoded = body === undefined ? null : decodeBase64(body);
   const complete = decoded !== null;
   if (!complete) run.state.complete = false;
@@ -438,7 +470,7 @@ const stableValue = (value: unknown): unknown => {
   return Object.fromEntries(
     Object.entries(record)
       .filter(([key]) => key !== "objectId" && key !== "customPreview")
-      .sort(([left], [right]) => compareCodePoints(left, right))
+      .sort(([left], [right]) => compareUnicodeCodePoints(left, right))
       .map(([key, item]) => [key, stableValue(item)]),
   );
 };
@@ -465,14 +497,49 @@ const stableValueComplete = (value: unknown): boolean => {
 
 const remoteObjectComplete = (value: unknown): boolean => {
   const record = recordValue(value);
-  if (record === undefined) return true;
-  return (
-    record.objectId === undefined &&
-    record.preview === undefined &&
-    record.customPreview === undefined &&
-    (record.type !== "object" || record.value !== undefined) &&
-    stableValueComplete(record)
-  );
+  if (
+    record === undefined ||
+    record.objectId !== undefined ||
+    record.preview !== undefined ||
+    record.customPreview !== undefined ||
+    !stableValueComplete(record)
+  )
+    return false;
+  switch (record.type) {
+    case "undefined":
+      return (
+        record.value === undefined && record.unserializableValue === undefined
+      );
+    case "string":
+    case "boolean":
+      return (
+        typeof record.value === record.type &&
+        record.unserializableValue === undefined
+      );
+    case "number":
+      return record.unserializableValue === undefined
+        ? typeof record.value === "number" && Number.isFinite(record.value)
+        : record.value === undefined &&
+            typeof record.unserializableValue === "string" &&
+            ["-0", "NaN", "Infinity", "-Infinity"].includes(
+              record.unserializableValue,
+            );
+    case "bigint":
+      return (
+        record.value === undefined &&
+        typeof record.unserializableValue === "string" &&
+        /^-?\d+n$/u.test(record.unserializableValue)
+      );
+    case "object":
+      return (
+        record.unserializableValue === undefined &&
+        (record.subtype === "null"
+          ? record.value === null
+          : record.value !== null && typeof record.value === "object")
+      );
+    default:
+      return false;
+  }
 };
 
 const decodeBase64 = (value: string): Buffer | null => {

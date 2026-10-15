@@ -1,3 +1,4 @@
+import { relationshipCoverageLimitations } from "./relationshipCoverage.js";
 import {
   callPathInputSchema,
   callPathResultSchema,
@@ -10,22 +11,24 @@ import {
   parseFunctionEvidence,
   type FunctionSnapshot,
 } from "./functionDossierEvidence.js";
-
-export { callPathInputSchema, callPathResultSchema };
-export type { CallPathInput, CallPathResult };
+import { isCallerOnlyIncompleteCoverage } from "./functionCallCoverage.js";
+import { compareUnicodeCodePoints } from "./unicodeCodePointOrder.js";
 
 /** Minimal directed caller-to-callee adjacency for call-path search. */
 class CallGraph {
   private readonly successors = new Map<string, Set<string>>();
+  private readonly predecessors = new Map<string, Set<string>>();
 
   mergeNode(node: string): void {
     if (!this.successors.has(node)) this.successors.set(node, new Set());
+    if (!this.predecessors.has(node)) this.predecessors.set(node, new Set());
   }
 
   mergeDirectedEdge(source: string, target: string): void {
     this.mergeNode(source);
     this.mergeNode(target);
     this.successors.get(source)?.add(target);
+    this.predecessors.get(target)?.add(source);
   }
 
   hasNode(node: string): boolean {
@@ -39,29 +42,31 @@ class CallGraph {
   outNeighbors(node: string): string[] {
     return [...(this.successors.get(node) ?? [])];
   }
+
+  inNeighbors(node: string): string[] {
+    return [...(this.predecessors.get(node) ?? [])];
+  }
 }
 
-/** Breadth-first shortest depth from start to goal, or null when unreachable. */
-const shortestPathDepth = (
+/** Shortest remaining distance for every node that can reach the goal. */
+const distancesToGoal = (
   graph: CallGraph,
-  start: string,
   goal: string,
-): number | null => {
-  if (start === goal) return 0;
-  const depth = new Map<string, number>([[start, 0]]);
-  const queue = [start];
+): ReadonlyMap<string, number> => {
+  if (!graph.hasNode(goal)) return new Map();
+  const depth = new Map<string, number>([[goal, 0]]);
+  const queue = [goal];
   for (let index = 0; index < queue.length; index += 1) {
     const node = queue[index] ?? "";
     const next = (depth.get(node) ?? 0) + 1;
-    for (const neighbor of graph.outNeighbors(node)) {
-      if (neighbor === goal) return next;
+    for (const neighbor of graph.inNeighbors(node)) {
       if (!depth.has(neighbor)) {
         depth.set(neighbor, next);
         queue.push(neighbor);
       }
     }
   }
-  return null;
+  return depth;
 };
 
 interface SearchState {
@@ -82,10 +87,8 @@ export const buildCallPath = (input: CallPathInput): CallPathResult => {
     start: parsed.start.address,
     goal: parsed.goal.address,
   });
-  const shortestDepth =
-    graph.hasNode(parsed.start.address) && graph.hasNode(parsed.goal.address)
-      ? shortestPathDepth(graph, parsed.start.address, parsed.goal.address)
-      : null;
+  const goalDistances = distancesToGoal(graph, parsed.goal.address);
+  const shortestDepth = goalDistances.get(parsed.start.address) ?? null;
   const paths =
     shortestDepth === null
       ? []
@@ -93,7 +96,7 @@ export const buildCallPath = (input: CallPathInput): CallPathResult => {
           graph,
           start: parsed.start.address,
           goal: parsed.goal.address,
-          shortestDepth,
+          goalDistances,
         }).paths.map((path) => citePath(path, snapshots));
   const shortestHops = paths[0]?.hops;
   const found = shortestHops !== undefined;
@@ -104,9 +107,7 @@ export const buildCallPath = (input: CallPathInput): CallPathResult => {
     goal: parsed.goal.address,
     explored: summarizeSearch(graph, search.reached),
     evidence_links: uniqueEvidence(snapshots.values()),
-    limitations: [...new Set(limitations)].sort((left, right) =>
-      left.localeCompare(right),
-    ),
+    limitations: [...new Set(limitations)].sort(compareUnicodeCodePoints),
   };
   const searchScope = { exhaustive };
   if (found)
@@ -135,7 +136,10 @@ const summarizeSearch = (
     (count, node) => count + (graph.hasNode(node) ? graph.outDegree(node) : 0),
     0,
   ),
-  depth_reached: Math.max(0, ...reached.values()),
+  depth_reached: [...reached.values()].reduce(
+    (maximum, depth) => Math.max(maximum, depth),
+    0,
+  ),
 });
 
 const prepareCallGraph = (input: CallPathInput) => {
@@ -154,9 +158,9 @@ const parseSnapshots = (
   const snapshots = new Map<string, FunctionSnapshot>();
   for (const group of groups) {
     const snapshot = parseFunctionEvidence(group);
-    const address = normalizeAddress(snapshot.procedure.address);
-    for (const callee of snapshot.collections.callees.items)
-      normalizeAddress(callee.address);
+    const address = parseCallPathAddress(snapshot.dossier.procedure.address);
+    for (const callee of snapshot.dossier.callees)
+      parseCallPathAddress(callee.address);
     if (snapshots.has(address))
       throw new TypeError(`Duplicate function Evidence for ${address}`);
     snapshots.set(address, snapshot);
@@ -178,9 +182,9 @@ const assertCompatible = (
     )
       throw new TypeError("Call-path Evidence mixes artifact subjects");
     if (
-      snapshot.provider.id !== first.provider.id ||
-      snapshot.provider.name !== first.provider.name ||
-      snapshot.provider.version !== first.provider.version
+      snapshot.evidence.provider.id !== first.evidence.provider.id ||
+      snapshot.evidence.provider.name !== first.evidence.provider.name ||
+      snapshot.evidence.provider.version !== first.evidence.provider.version
     )
       throw new TypeError("Call-path Evidence mixes providers");
   }
@@ -192,8 +196,8 @@ const createGraph = (
   const graph = new CallGraph();
   for (const [address, snapshot] of snapshots) {
     graph.mergeNode(address);
-    for (const callee of snapshot.collections.callees.items) {
-      const calleeAddress = normalizeAddress(callee.address);
+    for (const callee of snapshot.dossier.callees) {
+      const calleeAddress = parseCallPathAddress(callee.address);
       graph.mergeNode(calleeAddress);
       graph.mergeDirectedEdge(address, calleeAddress);
     }
@@ -227,21 +231,55 @@ const inspectSearch = ({
   const reached = new Map<string, number>([[start, 0]]);
   const queue = [start];
   const limitations: string[] = [];
+  let incompleteExpandedCoverage = false;
   for (let index = 0; index < queue.length; index += 1) {
     const node = queue[index];
     if (node === undefined) continue;
     const depth = reached.get(node) ?? 0;
-    if (node === goal) continue;
     const snapshot = snapshots.get(node);
+    if (snapshot !== undefined) {
+      const coverage = snapshot.evidence.relationship_coverage;
+      for (const limitation of snapshot.limitations)
+        limitations.push(limitation);
+      if (coverage !== null) {
+        for (const limitation of relationshipCoverageLimitations(coverage))
+          limitations.push(limitation);
+        for (const diagnostic of coverage.diagnostics ?? [])
+          limitations.push(diagnostic);
+      }
+      // The requested goal is a terminal for this search. Its outgoing edges
+      // cannot add a path to the goal, so its dossier limits are contextual
+      // but do not make the searched start-to-goal closure incomplete.
+      if (node === goal) continue;
+      const callees = snapshot.dossier.facet_availability?.callees;
+      if (callees?.available === false) {
+        limitations.push(callees.reason);
+        incompleteExpandedCoverage = true;
+      }
+      // Explicit, Evidence-bound relationship coverage owns completeness;
+      // generic provider/dossier limitations remain contextual. Legacy Evidence
+      // without that metadata retains its conservative limitation-based rule.
+      // The search only expands callee edges, so coverage that is unknown
+      // solely because callers are unobservable does not make the searched
+      // callee closure incomplete; the caller caveat stays in limitations.
+      if (
+        coverage === null
+          ? snapshot.limitations.length > 0
+          : coverage.status !== "complete" &&
+            !isCallerOnlyIncompleteCoverage(coverage)
+      )
+        incompleteExpandedCoverage = true;
+    } else if (node === goal) {
+      continue;
+    }
     if (snapshot === undefined) {
       limitations.push(
         `No analyze_function Evidence covers reachable function ${node}`,
       );
+      incompleteExpandedCoverage = true;
       continue;
     }
-    const neighbors = graph
-      .outNeighbors(node)
-      .sort((left, right) => left.localeCompare(right));
+    const neighbors = graph.outNeighbors(node).sort(compareUnicodeCodePoints);
     for (const neighbor of neighbors)
       if (!reached.has(neighbor)) {
         reached.set(neighbor, depth + 1);
@@ -252,7 +290,7 @@ const inspectSearch = ({
     graph,
     snapshots,
     reached,
-    exhaustive: limitations.length === 0,
+    exhaustive: !incompleteExpandedCoverage,
     limitations,
   };
 };
@@ -261,57 +299,63 @@ interface EnumerationInput {
   readonly graph: CallGraph;
   readonly start: string;
   readonly goal: string;
-  readonly shortestDepth: number;
+  readonly goalDistances: ReadonlyMap<string, number>;
 }
 
 const enumeratePaths = ({
   graph,
   start,
   goal,
-  shortestDepth,
+  goalDistances,
 }: EnumerationInput): {
   readonly paths: string[][];
 } => {
   const output: string[][] = [];
-  const state: EnumerationState = {
-    graph,
-    goal,
-    path: [start],
-    visited: new Set([start]),
-    output,
+  const path = [start];
+  const neighbors = new Map<string, readonly string[]>();
+  const frame = (node: string): EnumerationFrame => {
+    let candidates = neighbors.get(node);
+    if (candidates === undefined) {
+      const distance = goalDistances.get(node);
+      candidates = graph
+        .outNeighbors(node)
+        .filter(
+          (neighbor) =>
+            distance !== undefined &&
+            goalDistances.get(neighbor) === distance - 1,
+        )
+        .sort(compareUnicodeCodePoints);
+      neighbors.set(node, candidates);
+    }
+    return { neighbors: candidates, nextIndex: 0 };
   };
-  enumerateAtDepth(state, shortestDepth);
+  const pending = [frame(start)];
+  while (pending.length > 0) {
+    const current = pending.at(-1);
+    if (current === undefined) break;
+    if (path.at(-1) === goal) {
+      output.push([...path]);
+      pending.pop();
+      path.pop();
+      continue;
+    }
+    const neighbor = current.neighbors[current.nextIndex];
+    if (neighbor === undefined) {
+      pending.pop();
+      path.pop();
+      continue;
+    }
+    current.nextIndex += 1;
+    path.push(neighbor);
+    pending.push(frame(neighbor));
+  }
   return { paths: output };
 };
 
-interface EnumerationState {
-  readonly graph: CallGraph;
-  readonly goal: string;
-  readonly path: string[];
-  readonly visited: Set<string>;
-  readonly output: string[][];
+interface EnumerationFrame {
+  readonly neighbors: readonly string[];
+  nextIndex: number;
 }
-
-const enumerateAtDepth = (state: EnumerationState, remaining: number): void => {
-  const { graph, goal, path, visited, output } = state;
-  const current = path.at(-1);
-  if (current === undefined) return;
-  if (remaining === 0) {
-    if (current === goal) output.push([...path]);
-    return;
-  }
-  if (current === goal) return;
-  for (const neighbor of graph
-    .outNeighbors(current)
-    .sort((left, right) => left.localeCompare(right))) {
-    if (visited.has(neighbor)) continue;
-    visited.add(neighbor);
-    path.push(neighbor);
-    enumerateAtDepth(state, remaining - 1);
-    path.pop();
-    visited.delete(neighbor);
-  }
-};
 
 const citePath = (
   addresses: readonly string[],
@@ -334,7 +378,7 @@ const citePath = (
       (index > 0 ? snapshots.get(addresses[index - 1] ?? "") : undefined);
     return {
       address,
-      name: snapshot?.procedure.name ?? null,
+      name: snapshot?.dossier.procedure.name ?? null,
       evidence_links: snapshotLinks(supporting),
     };
   });
@@ -355,12 +399,10 @@ const citePath = (
 const snapshotLinks = (snapshot: FunctionSnapshot | undefined): string[] => {
   if (snapshot === undefined)
     throw new TypeError("Every call-path claim requires supporting Evidence");
-  return snapshot.evidence.map(({ evidence_id }) => evidence_id);
+  return [snapshot.evidence.evidence_id];
 };
 
 const uniqueEvidence = (snapshots: Iterable<FunctionSnapshot>): string[] =>
   [
     ...new Set([...snapshots].flatMap((snapshot) => snapshotLinks(snapshot))),
-  ].sort((left, right) => left.localeCompare(right));
-
-const normalizeAddress = (input: string): string => parseCallPathAddress(input);
+  ].sort(compareUnicodeCodePoints);

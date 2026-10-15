@@ -2,8 +2,9 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { createEvidence } from "../dist/domain/evidence.js";
-import { buildManagedPeFixture } from "./lib/managed-pe-fixture.mjs";
-import { functionDossier, json, run } from "./lib/verify-package-core.mjs";
+import { buildManagedPeFixture } from "./fixtures/managed/pe.mjs";
+import { functionDossier } from "./fixtures/managed/function-dossier.mjs";
+import { json, run } from "./lib/verify-package-core.mjs";
 
 const buildManagedFixtures = async (workspace) => {
   const managedPath = join(workspace, "managed-fixture.exe");

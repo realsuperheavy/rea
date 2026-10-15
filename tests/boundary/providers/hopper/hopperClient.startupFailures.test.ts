@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { access } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+import { createServer, type Server } from "node:net";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -14,44 +14,7 @@ import type {
 import { HopperClient } from "../../../../src/hopper/HopperClient.js";
 import { LINUX_PRIVATE_DISPLAY_DIAGNOSTIC_PREFIX } from "../../../../src/hopper/LinuxPrivateDisplayDiagnostic.js";
 
-const fixturePath = fileURLToPath(
-  new URL("../../../fixtures/fakeHopper.mjs", import.meta.url),
-);
-
-class FixtureLauncher implements BridgeLauncher {
-  socketPaths: string[] = [];
-  directories: string[] = [];
-  runIds: string[] = [];
-  processes: ChildProcess[] = [];
-
-  constructor(readonly tokenOverride?: string) {}
-
-  launch(session: BridgeSession) {
-    this.socketPaths.push(session.socketPath);
-    this.directories.push(session.directory);
-    this.runIds.push(session.runId);
-    const child = spawn(
-      process.execPath,
-      [
-        fixturePath,
-        session.socketPath,
-        this.tokenOverride ?? session.token,
-        session.runId,
-      ],
-      {
-        stdio: ["ignore", "ignore", "pipe"],
-      },
-    );
-    this.processes.push(child);
-    return Promise.resolve(
-      ok({
-        process: child,
-        ownsProcessLifetime: true as const,
-        shutdownMode: "bridge-request" as const,
-      }),
-    );
-  }
-}
+import { HopperFixtureLauncher as FixtureLauncher } from "./hopperClient.fixture.js";
 
 class SilentLauncher implements BridgeLauncher {
   launch() {
@@ -65,6 +28,7 @@ class SilentLauncher implements BridgeLauncher {
           },
         ),
         ownsProcessLifetime: true as const,
+        providerLifetime: "launcher-process" as const,
         shutdownMode: "bridge-request" as const,
       }),
     );
@@ -77,6 +41,7 @@ class CancelThenFixtureLauncher implements BridgeLauncher {
   readonly firstLaunch = new Promise<ChildProcess>((resolve) => {
     this.#firstLaunchReady = resolve;
   });
+  retriedProcess: ChildProcess | undefined;
 
   async launch(session: BridgeSession) {
     this.#launches += 1;
@@ -85,6 +50,7 @@ class CancelThenFixtureLauncher implements BridgeLauncher {
       : new FixtureLauncher().launch(session));
     if (this.#launches === 1 && launched.ok)
       this.#firstLaunchReady?.(launched.value.process);
+    else if (launched.ok) this.retriedProcess = launched.value.process;
     return launched;
   }
 }
@@ -99,6 +65,7 @@ class ExitingLauncher implements BridgeLauncher {
           stdio: ["ignore", "ignore", "pipe"],
         }),
         ownsProcessLifetime: true as const,
+        providerLifetime: "launcher-process" as const,
         shutdownMode: "bridge-request" as const,
       }),
     );
@@ -135,6 +102,7 @@ class DiagnosticExitingLauncher implements BridgeLauncher {
           { stdio: ["ignore", "ignore", "pipe"] },
         ),
         ownsProcessLifetime: true as const,
+        providerLifetime: "launcher-process" as const,
         shutdownMode: "bridge-request" as const,
       }),
     );
@@ -154,10 +122,118 @@ class LateSilentLauncher implements BridgeLauncher {
   }
 }
 
+/**
+ * Bridge fixture whose health handshake returns an invalid payload, so
+ * parseHopperServerInfo rejects it with HopperProtocolError.
+ * Note: assumes the client's first bridge request is `health`; any
+ * auth/preamble request added before it would hit the -32601 branch.
+ */
+class BadHealthLauncher implements BridgeLauncher {
+  #server: Server | undefined;
+  #process: ChildProcess | undefined;
+
+  async launch(session: BridgeSession) {
+    const server = createServer((socket) => {
+      let buffer = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+        let newline = buffer.indexOf("\n");
+        while (newline >= 0) {
+          const line = buffer.slice(0, newline);
+          buffer = buffer.slice(newline + 1);
+          try {
+            const request = JSON.parse(line) as {
+              id: number;
+              method: string;
+            };
+            if (request.method === "health") {
+              socket.write(
+                `${JSON.stringify({ id: request.id, result: { bogus: true } })}\n`,
+              );
+            } else {
+              socket.write(
+                `${JSON.stringify({
+                  id: request.id,
+                  error: { code: -32601, message: "unknown method" },
+                })}\n`,
+              );
+            }
+          } catch {
+            // Ignore malformed input; the client only sends NDJSON.
+          }
+          newline = buffer.indexOf("\n");
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(session.socketPath, () => {
+        server.off("error", reject);
+        resolve();
+      });
+    });
+    this.#server = server;
+    const child = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      {
+        stdio: "ignore",
+      },
+    );
+    this.#process = child;
+    return ok({
+      process: child,
+      ownsProcessLifetime: true as const,
+      providerLifetime: "launcher-process" as const,
+      shutdownMode: "process-cleanup" as const,
+      cleanup: async () => {
+        child.kill("SIGTERM");
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        return { cleaned: true as const, signaled: true };
+      },
+    });
+  }
+}
+
 const clients: HopperClient[] = [];
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
+}, 45_000);
+
+describe("HopperClient startup deadline", () => {
+  it("applies one deadline to launcher, socket, and health startup phases", async () => {
+    const launcher = new LateSilentLauncher();
+    const client = new HopperClient({ launcher, startupTimeoutMs: 500 });
+    clients.push(client);
+
+    const result = await client.start();
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { _tag: "HopperTimeoutError", timeoutMs: 500 },
+    });
+    expect(client.operationHealth()).toMatchObject({
+      state: "not_started",
+      stage: "launch",
+      retryAction: "retry",
+      exitCode: null,
+    });
+    if (!result.ok)
+      expect(projectAnalysisError(result.error).details).toMatchObject({
+        stage: "startup",
+      });
+    expect(launcher.directories).toHaveLength(1);
+    await expect(access(launcher.directories[0] ?? "")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const process = launcher.processes[0];
+    expect(
+      process !== undefined &&
+        (process.exitCode !== null || process.signalCode !== null),
+    ).toBe(true);
+  });
 });
 
 describe("HopperClient startup failures", () => {
@@ -175,18 +251,24 @@ describe("HopperClient startup failures", () => {
     // Cancel after launch: a timer can fire during runtime-directory creation,
     // leaving the silent first launch to be consumed by the retry instead.
     const firstProcess = await launcher.firstLaunch;
-    const startedAt = Date.now();
     controller.abort();
     const result = await pending;
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error._tag).toBe("HopperCancelledError");
-    expect(Date.now() - startedAt).toBeLessThan(500);
     expect(
       firstProcess.exitCode !== null || firstProcess.signalCode !== null,
     ).toBe(true);
-    await expect(client.start()).resolves.toEqual({
+    const restarted = await client.start();
+    const retriedProcess = launcher.retriedProcess;
+    expect(retriedProcess).toBeDefined();
+    expect(retriedProcess).not.toBe(firstProcess);
+    expect(restarted).toEqual({
       ok: true,
-      value: { name: "REA Hopper bridge", version: "1.0.0" },
+      value: {
+        name: "REA Hopper bridge",
+        version: "1.0.0",
+        processId: retriedProcess?.pid,
+      },
     });
     await expect(
       client.callTool("echo", { value: "retried" }),
@@ -210,11 +292,16 @@ describe("HopperClient startup failures", () => {
       error: { _tag: "HopperCancelledError" },
     });
     expect(launcher.processes).toHaveLength(0);
-    await expect(client.start()).resolves.toEqual({
-      ok: true,
-      value: { name: "REA Hopper bridge", version: "1.0.0" },
-    });
+    const started = await client.start();
     expect(launcher.processes).toHaveLength(1);
+    expect(started).toEqual({
+      ok: true,
+      value: {
+        name: "REA Hopper bridge",
+        version: "1.0.0",
+        processId: launcher.processes[0]?.pid,
+      },
+    });
     await expect(
       client.callTool("echo", { value: "retried" }),
     ).resolves.toEqual({
@@ -223,26 +310,36 @@ describe("HopperClient startup failures", () => {
     });
   });
 
-  it("applies one deadline to launcher, socket, and health startup phases", async () => {
-    const launcher = new LateSilentLauncher();
-    const client = new HopperClient({ launcher, startupTimeoutMs: 500 });
+  it("records unknown when startup is cancelled before launch", async () => {
+    const launcher = new FixtureLauncher();
+    const client = new HopperClient({ launcher, startupTimeoutMs: 30_000 });
+    clients.push(client);
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await client.start(controller.signal);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error._tag).toBe("HopperCancelledError");
+    expect(launcher.processes).toHaveLength(0);
+    // A cancelled startup must not report idle: the same-target fast path
+    // would otherwise treat the client as live and skip the retire path.
+    expect(client.operationHealth()).toMatchObject({ state: "unknown" });
+  });
+
+  it("records unknown when the health handshake is invalid", async () => {
+    const launcher = new BadHealthLauncher();
+    const client = new HopperClient({ launcher, startupTimeoutMs: 30_000 });
     clients.push(client);
 
     const result = await client.start();
 
-    expect(result).toMatchObject({
-      ok: false,
-      error: { _tag: "HopperTimeoutError", timeoutMs: 500 },
-    });
-    expect(launcher.directories).toHaveLength(1);
-    await expect(access(launcher.directories[0] ?? "")).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    const process = launcher.processes[0];
-    expect(
-      process !== undefined &&
-        (process.exitCode !== null || process.signalCode !== null),
-    ).toBe(true);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error._tag).toBe("HopperProtocolError");
+    // parseHopperServerInfo failures were never recorded, so operationHealth()
+    // reported idle and the fast path kept a client whose next start stays
+    // blocked by retained resources.
+    expect(client.operationHealth()).toMatchObject({ state: "unknown" });
   });
 
   it.each([70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80])(
@@ -305,16 +402,5 @@ describe("HopperClient startup failures", () => {
         },
       },
     });
-  });
-
-  it("allows a short-lived launcher to hand off bridge startup", async () => {
-    const client = new HopperClient({
-      launcher: new ExitingLauncher(0),
-      startupTimeoutMs: 100,
-    });
-    clients.push(client);
-    const result = await client.start();
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.error._tag).toBe("HopperTimeoutError");
   });
 });

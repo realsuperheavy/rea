@@ -1,10 +1,17 @@
 # Firmware analysis
 
-REA integrates **Binwalk 3.1.0** for region inspection and **Unblob 26.6.4** for
-explicit extraction. This first firmware milestone is verified on Linux x64.
+REA accepts **Binwalk 3.1.x** for region inspection and **Unblob 26.6.x** for
+explicit extraction. The report parsers are verified with Binwalk 3.1.0 and
+Unblob 26.6.4. Another build on those lines is accepted, the observed version
+is reported, and a limitation records that the parser was not verified against
+that build. This first firmware milestone is verified on Linux x64.
 No device, root privilege, mount, emulation or execution of extracted programs
 is needed. Arbitrary firmware bytes do not pass native executable admission;
 select a returned ELF separately for supported Ghidra analysis.
+
+On Linux, Binwalk and Unblob run as REA-owned processes and require a
+procps-compatible `ps` on REA's `PATH`; see the shared
+[Linux process prerequisite](installation.md#linux-owned-process-prerequisite).
 
 ## Caller-supplied tools
 
@@ -16,10 +23,17 @@ export REA_UNBLOB_COMMAND=/absolute/path/to/unblob
 ```
 
 REA does not install these tools, their dependencies or system packages. It
-checks the actual tool version when executing a request. Inspection and
+checks the tool's `--version` banner when executing a request. Binwalk must
+print `binwalk <version>` and Unblob must print the version alone. Inspection and
 extraction have independent prerequisites; one does not require the other.
 Both require util-linux `prlimit`, normally `/usr/bin/prlimit`; override its
 absolute path with `REA_FIRMWARE_PRLIMIT_COMMAND` if needed.
+
+REA retains at most 8 MiB of combined stdout and stderr per command. Exceeding
+that diagnostic budget stops analysis with an explicit truncated-output error;
+child process limits do not bound parent-side pipe retention. Completed commands
+drain their output streams before recording diagnostics. Failed worker cleanup
+retains the worker and workspace for retry before another request or at shutdown.
 
 Unblob needs the external extractor for the selected format on its inherited
 `PATH`: for example, `debugfs` for ext2/ext3/ext4. Its default Landlock sandbox
@@ -34,7 +48,7 @@ git submodule update --init third_party/binwalk third_party/unblob
 ```
 
 Normal REA builds and npm packages do not include or build these sources or
-engine binaries. See [upstream provenance](../third_party/README.md).
+engine binaries. See [upstream provenance](https://github.com/morluto/rea/blob/main/third_party/README.md).
 
 ## CLI and MCP
 
@@ -93,6 +107,23 @@ build's source revision, so that field remains unknown.
   engine finished its configured extraction without those reported conditions;
   default skip rules and format coverage still apply. It does not establish
   complete firmware reconstruction.
+- `extraction_gaps` makes those conditions recoverable: a row identifies an
+  unextracted region or a failed task/stage. A chunk retains its identity and
+  byte range, plus its original-file range when it belongs to the selected input.
+  A multi-file stage retains its reported ID and handler with unknown byte ranges;
+  a standalone task failure keeps unavailable stage identity null. Rows retain exact dependency names from
+  the producer's missing-dependency reports; an accepted report with no names
+  remains a failure with unknown dependencies; no executable identity or specific installation step is inferred. Each row's `continuation_id`
+  references one instruction in `extraction_continuations`, so many regions
+  share recovery prose without losing any region identity. Instructions use
+  already configured capabilities where one exists. Every extraction rerun
+  requires a fresh absent `output_directory`, preserving the prior evidence.
+  Nested unknown chunks use `inspect_firmware_regions` on the actual published
+  child rather than repeating the same extraction with unchanged handlers.
+  Inspection requires separately configured Binwalk (`REA_BINWALK_COMMAND`);
+  without it, the inspection step is unavailable and the region remains unexamined. A listed gap does not
+  mean the target is corrupt or that a retained region is empty; REA installs
+  nothing.
 - The destination must be absent, absolute, with an existing parent. Publication
   uses exclusive, symlink-resistant writes and durable digest readback. Existing
   destinations are never overwritten. This is not an atomic directory rename:
@@ -113,8 +144,10 @@ Select a verified native child for the existing tools:
 ```
 
 Then use `analyze_function`, `inspect_native_api` or the other native primitives.
-Native architecture and executable validation still apply. This milestone does
-not add MIPS/PPC/RISC-V decompilation, raw flash load profiles, bootloader/device
+Native architecture and executable validation still apply. Generic
+[MIPS ELF](ghidra-mips.md) and [RISC-V ELF](ghidra-riscv.md) lanes are separate
+documents with their own admission boundaries. This milestone does
+not add PPC decompilation, raw flash load profiles, bootloader/device
 tree semantics, vulnerability scanning, emulation or hardware runtime capture.
 
 ## Resource and lifecycle policy
@@ -125,8 +158,9 @@ tree semantics, vulnerability scanning, emulation or hardware runtime capture.
   Unblob one worker. No automatic parallel extraction engines.
 - **120-second** deadline; inherited **1 GiB per-process address-space** limit,
   120 CPU seconds and zero core-dump allowance through `prlimit`.
-- JSON reports: at most **8 MiB**; oversized reports fail without a truncated
-  success. Diagnostic output is bounded with exact captured byte counts.
+- JSON reports: at most **8 MiB** and valid UTF-8; malformed encoding and
+  oversized reports fail without repairing or truncating producer data.
+  Diagnostic output is bounded with exact captured byte counts.
 - Default staging budget: **256 MiB** and **10,000 entries**, configurable using
   `max_output_bytes` / `max_output_files` (CLI `--max-output-bytes` /
   `--max-output-files`). Depth defaults to 3, allowed range 1–10.
@@ -154,6 +188,12 @@ records gzip offset/length and extracted file hashes. Real verification checks
 CLI/MCP, full-file and selected-range extraction, unknown chunks, depth limits,
 content parity and unchanged source bytes. No binary fixture is committed.
 
+The optional missing-extractor lane asserts dependency names and the owning
+handler in `extraction_gaps`. Those assertions must be run against the pinned
+Unblob release to establish real-provider coverage; synthetic producer fixtures
+alone do not verify Unblob's report nesting or stage identities. The gap ownership
+claims remain unverified against real Unblob until that lane runs.
+
 Additional lanes are explicit, so the base lane stays small:
 
 ```sh
@@ -161,7 +201,7 @@ Additional lanes are explicit, so the base lane stays small:
 REA_FIRMWARE_VERIFY_EXT4=1 npm run fixtures:firmware
 REA_FIRMWARE_VERIFY_EXT4=1 npm run verify:firmware
 
-# Existing Ghidra 12.1.4 and Java required.
+# Existing Ghidra 12.1.x and its declared JDK required.
 REA_FIRMWARE_VERIFY_GHIDRA=1 npm run verify:firmware
 ```
 

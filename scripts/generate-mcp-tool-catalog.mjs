@@ -1,15 +1,12 @@
+import { mkdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { formatGeneratedFile } from "./lib/format-generated-file.mjs";
 import { Client, InMemoryTransport } from "@modelcontextprotocol/client";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { McpServer } from "@modelcontextprotocol/server";
 
 import { TOOL_CONTRACTS } from "../dist/contracts/toolContracts.js";
-import { MANAGED_WORKFLOW_TOOL_CONTRACTS } from "../dist/contracts/managedWorkflowToolContracts.js";
-import { ArtifactProvider } from "../dist/artifacts/ArtifactProvider.js";
-import { ManagedStaticProvider } from "../dist/dotnet/ManagedStaticProvider.js";
-import { NativeMacOSProvider } from "../dist/native/NativeMacOSProvider.js";
+import { MANAGED_WORKFLOW_TOOL_CONTRACTS } from "../dist/contracts/managed/managedWorkflowToolContracts.js";
 import { toolRegistrationOptions } from "../dist/server/toolRegistrationOptions.js";
 import { ensureGeneratedFile } from "./lib/generated-file.mjs";
 
@@ -19,9 +16,9 @@ for (const argument of arguments_)
     throw new Error(`Unknown MCP tool catalog option: ${argument}`);
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-// The checked-in catalog is a portable package artifact. Keep its canonical
-// provider metadata independent of the machine running the generator.
-const CATALOG_PLATFORM = "darwin";
+// This generated metadata supports schema conformance tests;
+// production MCP tools are registered from their canonical contracts directly.
+// Keep the test metadata portable and regenerate it with `npm run mcp-catalog:generate`.
 const sessionToolNames = new Set([
   ...TOOL_CONTRACTS.filter(({ kind }) => kind === "session").map(
     ({ name }) => name,
@@ -88,15 +85,6 @@ async function sdkToolCatalog() {
     await Promise.allSettled([client.close(), server.close()]);
   }
 }
-const auxiliaryProviders = [
-  new ArtifactProvider(CATALOG_PLATFORM),
-  new NativeMacOSProvider(undefined, CATALOG_PLATFORM),
-  new ManagedStaticProvider(),
-].map((provider) => ({
-  identity: provider.identity(),
-  capabilities: provider.capabilities(),
-}));
-
 const canonicalizeJson = (value) => {
   if (Array.isArray(value)) return value.map(canonicalizeJson);
   if (value === null || typeof value !== "object") return value;
@@ -107,101 +95,13 @@ const canonicalizeJson = (value) => {
   );
 };
 
-const payloadJson = JSON.stringify(
-  canonicalizeJson({ catalog, auxiliaryProviders }),
-  null,
-  2,
-);
-const source = await formatGeneratedFile(
-  "src/generatedMcpToolCatalog.ts",
-  `import type { ToolAnnotations } from "@modelcontextprotocol/server";
-import type {
-  CapabilityDescriptor,
-  ProviderIdentity,
-} from "./application/AnalysisProvider.js";
-import type { ToolKind } from "./contracts/toolContractTypes.js";
-import type { ToolEffects } from "./contracts/toolEffects.js";
-
-interface GeneratedTool {
-  readonly name: string;
-  readonly analysisOperation: CapabilityDescriptor["operation"] | null;
-  readonly title: string;
-  readonly description: string;
-  readonly kind: ToolKind;
-  readonly requiresSession: boolean;
-  readonly inputSchema: Readonly<Record<string, unknown>>;
-  readonly outputSchema: Readonly<Record<string, unknown>>;
-  readonly annotations: ToolAnnotations;
-  readonly effects: ToolEffects;
-}
-
-interface GeneratedProvider {
-  readonly identity: ProviderIdentity;
-  readonly capabilities: readonly CapabilityDescriptor[];
-}
-
-interface GeneratedPayload {
-  readonly catalog: readonly GeneratedTool[];
-  readonly auxiliaryProviders: readonly GeneratedProvider[];
-}
-
-const GENERATED_PAYLOAD_JSON = ${JSON.stringify(payloadJson)};
-const generatedPayload: unknown = JSON.parse(GENERATED_PAYLOAD_JSON);
-if (!isGeneratedPayload(generatedPayload))
-  throw new TypeError("Generated MCP catalog payload is invalid");
-
-/** Generated from TOOL_CONTRACTS; do not edit. */
-export const GENERATED_MCP_TOOL_CATALOG = generatedPayload.catalog;
-
-/** Generated lightweight metadata for lazily loaded auxiliary providers. */
-export const GENERATED_AUXILIARY_PROVIDERS = generatedPayload.auxiliaryProviders;
-
-function isGeneratedPayload(value: unknown): value is GeneratedPayload {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.catalog) &&
-    value.catalog.every(isGeneratedTool) &&
-    Array.isArray(value.auxiliaryProviders) &&
-    value.auxiliaryProviders.every(isGeneratedProvider)
-  );
-}
-
-function isGeneratedTool(value: unknown): value is GeneratedTool {
-  return (
-    isRecord(value) &&
-    typeof value.name === "string" &&
-    (typeof value.analysisOperation === "string" ||
-      value.analysisOperation === null) &&
-    typeof value.title === "string" &&
-    typeof value.description === "string" &&
-    typeof value.kind === "string" &&
-    typeof value.requiresSession === "boolean" &&
-    isRecord(value.inputSchema) &&
-    isRecord(value.outputSchema) &&
-    isRecord(value.annotations) &&
-    isRecord(value.effects)
-  );
-}
-
-function isGeneratedProvider(value: unknown): value is GeneratedProvider {
-  return (
-    isRecord(value) &&
-    isRecord(value.identity) &&
-    Array.isArray(value.capabilities)
-  );
-}
-
-function isRecord(
-  value: unknown,
-): value is Readonly<Record<string, unknown>> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-`,
-);
-
+const payloadJson = JSON.stringify(canonicalizeJson({ catalog }), null, 2);
+const outputPath = join(root, ".cache/mcp-tool-catalog.json");
+if (!arguments_.has("--check"))
+  await mkdir(dirname(outputPath), { recursive: true });
 await ensureGeneratedFile({
-  path: join(root, "src/generatedMcpToolCatalog.ts"),
-  source,
+  path: outputPath,
+  source: `${payloadJson}\n`,
   check: arguments_.has("--check"),
   generateCommand: "npm run mcp-catalog:generate",
 });

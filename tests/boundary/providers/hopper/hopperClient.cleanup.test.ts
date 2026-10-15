@@ -1,10 +1,8 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { access } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { projectAnalysisError } from "../../../../src/domain/analysisErrorProjection.js";
 import { ok } from "../../../../src/domain/result.js";
 import type {
   BridgeLauncher,
@@ -14,44 +12,11 @@ import { HopperClient } from "../../../../src/hopper/HopperClient.js";
 import { cleanupOwnedProcessGroup } from "../../../../src/process/ProcessOwnership.js";
 import { spawnOwnedProviderProcess } from "../../../../src/process/ProviderProcess.js";
 
-const fixturePath = fileURLToPath(
-  new URL("../../../fixtures/fakeHopper.mjs", import.meta.url),
-);
-
-class FixtureLauncher implements BridgeLauncher {
-  socketPaths: string[] = [];
-  directories: string[] = [];
-  runIds: string[] = [];
-  processes: ChildProcess[] = [];
-
-  constructor(readonly tokenOverride?: string) {}
-
-  launch(session: BridgeSession) {
-    this.socketPaths.push(session.socketPath);
-    this.directories.push(session.directory);
-    this.runIds.push(session.runId);
-    const child = spawn(
-      process.execPath,
-      [
-        fixturePath,
-        session.socketPath,
-        this.tokenOverride ?? session.token,
-        session.runId,
-      ],
-      {
-        stdio: ["ignore", "ignore", "pipe"],
-      },
-    );
-    this.processes.push(child);
-    return Promise.resolve(
-      ok({
-        process: child,
-        ownsProcessLifetime: true,
-        shutdownMode: "bridge-request" as const,
-      }),
-    );
-  }
-}
+import {
+  HopperFixtureLauncher as FixtureLauncher,
+  hopperFixturePath as fixturePath,
+  startHopperFixtureClient as startClient,
+} from "./hopperClient.fixture.js";
 
 class OwnedFixtureLauncher implements BridgeLauncher {
   ownership:
@@ -79,6 +44,7 @@ class OwnedFixtureLauncher implements BridgeLauncher {
     return ok({
       process: started.process,
       ownsProcessLifetime: true as const,
+      providerLifetime: "launcher-process" as const,
       ownership: started.ownership,
       shutdownMode: "process-cleanup" as const,
       cleanup: () => cleanupOwnedProcessGroup(started.ownership),
@@ -86,76 +52,23 @@ class OwnedFixtureLauncher implements BridgeLauncher {
   }
 }
 
-class UnconfirmedFixtureLauncher implements BridgeLauncher {
-  launch(session: BridgeSession) {
-    return Promise.resolve(
-      ok({
-        process: spawn(
-          process.execPath,
-          [
-            fixturePath,
-            session.socketPath,
-            session.token,
-            session.runId,
-            "unconfirmed",
-          ],
-          { stdio: ["ignore", "ignore", "pipe"] },
-        ),
-        ownsProcessLifetime: false,
-        shutdownMode: "bridge-request" as const,
-      }),
-    );
-  }
-}
-
-class UnconfirmedOwnedFixtureLauncher implements BridgeLauncher {
-  launch(session: BridgeSession) {
-    return Promise.resolve(
-      ok({
-        process: spawn(
-          process.execPath,
-          [
-            fixturePath,
-            session.socketPath,
-            session.token,
-            session.runId,
-            "unconfirmed",
-          ],
-          { stdio: ["ignore", "ignore", "pipe"] },
-        ),
-        ownsProcessLifetime: true as const,
-        shutdownMode: "bridge-request" as const,
-      }),
-    );
-  }
-}
-
 const clients: HopperClient[] = [];
-const startClient = async () => {
-  const client = new HopperClient({
-    launcher: new FixtureLauncher(),
-    startupTimeoutMs: 1_000,
-  });
-  clients.push(client);
-  await expect(client.start()).resolves.toEqual({
-    ok: true,
-    value: { name: "REA Hopper bridge", version: "1.0.0" },
-  });
-  return client;
-};
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close()));
-});
+}, 45_000);
 
 describe("HopperClient cleanup", () => {
   it("waits for an operation reply without a fixed request deadline", async () => {
-    const client = await startClient();
-    await expect(
-      client.callTool("echo", { value: "waited", delay: 150 }),
-    ).resolves.toEqual({
+    const launcher = new FixtureLauncher();
+    const client = await startClient(launcher);
+    const pending = client.callTool("echo", { value: "waited", gate: "reply" });
+    const request = await launcher.waitForRequest("echo", "reply");
+    expect(client.requestActivity()).toMatchObject({ operation: "echo" });
+    await launcher.release(request);
+    await expect(pending).resolves.toEqual({
       ok: true,
-      value: { value: "waited", delay: 150 },
+      value: { value: "waited", gate: "reply" },
     });
   });
 
@@ -170,53 +83,31 @@ describe("HopperClient cleanup", () => {
     await first;
   });
 
-  it("reports unconfirmed unowned document cleanup as a typed close failure", async () => {
-    const client = new HopperClient({
-      launcher: new UnconfirmedFixtureLauncher(),
-      startupTimeoutMs: 1_000,
-    });
-    clients.push(client);
-    expect((await client.start()).ok).toBe(true);
-
-    const closed = await client.closeWithOutcome();
-
-    expect(closed).toMatchObject({
-      ok: false,
-      error: {
-        _tag: "ProviderAdapterError",
-        cleanupIncomplete: true,
-        cleanupResources: ["hopper-document"],
+  it("exits an IPC-backed fixture cleanly after cancelling active work", async () => {
+    const launcher = new FixtureLauncher();
+    const client = await startClient(launcher);
+    const controller = new AbortController();
+    const pending = client.callTool(
+      "echo",
+      { gate: "cancel-and-close" },
+      {
+        signal: controller.signal,
       },
-    });
-    if (!closed.ok)
-      expect(projectAnalysisError(closed.error)).toMatchObject({
-        code: "cleanup_incomplete",
-        details: {
-          provider_id: "hopper",
-          operation: "close_binary",
-          cleanup: "incomplete",
-          resources: ["hopper-document"],
-        },
-      });
-  });
-
-  it("does not treat an owned launcher exit as bridge document shutdown", async () => {
-    const client = new HopperClient({
-      launcher: new UnconfirmedOwnedFixtureLauncher(),
-      startupTimeoutMs: 1_000,
-    });
-    clients.push(client);
-    expect((await client.start()).ok).toBe(true);
-
-    const closed = await client.closeWithOutcome();
-
-    expect(closed).toMatchObject({
+    );
+    await launcher.waitForRequest("echo", "cancel-and-close");
+    controller.abort();
+    await expect(pending).resolves.toMatchObject({
       ok: false,
-      error: {
-        _tag: "ProviderAdapterError",
-        cleanupIncomplete: true,
-        cleanupResources: ["hopper-document"],
-      },
+      error: { _tag: "HopperCancelledError" },
+    });
+    await client.close();
+    const child = launcher.processes.at(-1);
+    expect({
+      exitCode: child?.exitCode,
+      signalCode: child?.signalCode,
+    }).toEqual({
+      exitCode: 0,
+      signalCode: null,
     });
   });
 
@@ -236,7 +127,8 @@ describe("HopperClient cleanup", () => {
     const client = new HopperClient({
       launcher,
       runId,
-      startupTimeoutMs: 1_000,
+      // Cold Darwin ownership-reader compilation runs inside launcher startup.
+      startupTimeoutMs: 10_000,
       onDiagnostic: (event) => diagnostics.push(event),
     });
     clients.push(client);

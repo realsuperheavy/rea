@@ -6,29 +6,47 @@ import { z } from "zod";
 // It is a protocol fixture, not evidence of JADX decompiler support.
 const mode = process.env.REA_FAKE_JADX_MODE ?? "normal";
 const server = new McpServer({
-  name: "jadx-headless-mcp",
-  version: mode === "version" ? "99.0.0" : "0.7.1",
+  name: mode === "empty-server-identity" ? "" : "rea-jadx-bridge",
+  version:
+    mode === "empty-server-identity" ? "" : mode === "version" ? "99.0.0" : "1",
 });
+const requestedCount = Number.parseInt(
+  process.env.REA_FAKE_JADX_CLASS_COUNT ?? "",
+  10,
+);
+const generatedCount =
+  Number.isInteger(requestedCount) && requestedCount >= 0
+    ? requestedCount
+    : mode === "large-inventory"
+      ? 9000
+      : 400;
 const classes = [
   "fixture.Target",
-  ...Array.from({ length: 400 }, (_, index) => `fixture.Class${index}`),
+  ...Array.from(
+    { length: generatedCount },
+    (_, index) => `fixture.Class${index}`,
+  ),
+  ...(mode === "duplicate-class-name" ? ["fixture.Target"] : []),
 ];
 const methods = [
   {
     name: "onCreate",
     signature: "onCreate(Bundle): void",
+    dex_descriptor: "(Landroid/os/Bundle;)V",
     is_constructor: false,
     def_pos: 0,
   },
   {
     name: "choose",
     signature: "choose(String): void",
+    dex_descriptor: "(Ljava/lang/String;)V",
     is_constructor: false,
     def_pos: 0,
   },
   {
     name: "choose",
     signature: "choose(int): void",
+    dex_descriptor: "(I)V",
     is_constructor: false,
     def_pos: 0,
   },
@@ -37,6 +55,15 @@ const text = (value) => ({ content: [{ type: "text", text: value }] });
 const json = (value) => text(JSON.stringify(value));
 const register = (name, handler) =>
   server.registerTool(name, { inputSchema: z.looseObject({}) }, handler);
+register("rea_jvm_status", () =>
+  json({
+    engine_reported_version: mode === "engine-version" ? "0.7.0" : "0.7.1",
+    max_heap_bytes: 8 * 1024 * 1024 * 1024,
+    available_processors: 4,
+    java_version: "21-fixture",
+    metadata_scope: "parsed_members",
+  }),
+);
 register("load_apk", async ({ path }) => {
   if (mode === "stall") await new Promise(() => {});
   return json({
@@ -48,23 +75,25 @@ register("load_apk", async ({ path }) => {
     resources: "full",
   });
 });
-register("get_app_info", () =>
-  json({
+register("get_app_info", () => {
+  if (mode === "rpc-disconnect") process.exit(17);
+  return json({
     package: "fixture",
     version_name: "1",
     version_code: "1",
     min_sdk: "26",
     target_sdk: "33",
     permissions: ["android.permission.INTERNET"],
-  }),
-);
+  });
+});
 register("get_android_manifest", () => {
-  if (mode === "tool-error")
+  if (mode === "tool-error" || mode === "cleanup-failure")
     return {
       ...text("manifest decoder rejected malformed binary XML"),
       isError: true,
     };
   if (mode === "frame-overflow") return text("x".repeat(9 * 1024 * 1024));
+  if (mode === "large-manifest") return text("x".repeat(1024 * 1024));
   return text('<manifest package="fixture"/>');
 });
 register("list_classes", ({ offset, limit }) =>
@@ -113,10 +142,18 @@ register("get_method_body", ({ method_name, overload_index }) =>
   }),
 );
 for (const name of ["get_xrefs_to_class", "get_xrefs_to_method"])
-  register(name, ({ class_name, method_name }) =>
+  register(name, ({ class_name, method_name, overload_index }) =>
     json({
       target:
         method_name === undefined ? class_name : `${class_name}.${method_name}`,
+      ...(method_name === undefined
+        ? {}
+        : {
+            overload_index,
+            reported_signature: methods.filter(
+              (method) => method.name === method_name,
+            )[overload_index]?.signature,
+          }),
       total: mode === "partial-xrefs" ? 2 : 1,
       count: 1,
       resolve_line: false,
@@ -133,3 +170,6 @@ for (const name of ["get_xrefs_to_class", "get_xrefs_to_method"])
     }),
   );
 await server.connect(new StdioServerTransport());
+// A refused cleanup must leave a live process for verified fixture teardown.
+// Otherwise stdin EOF races the ownership scan with the server's natural exit.
+if (mode === "cleanup-failure") setInterval(() => {}, 1000);

@@ -5,8 +5,9 @@ import { z } from "zod";
 import { browserCompletenessSchema } from "./browserCompleteness.js";
 import {
   browserAllowedOriginsSchema,
-  browserEndpointSchema,
+  browserObservationEndpointSchema,
 } from "./browserObservation.js";
+import { browserVersionSchema } from "./browserObservationSchemas.js";
 
 /** Self-verifying inline PNG artifact for CLI/MCP parity. */
 export const webScreenshotArtifactSchema = z
@@ -33,21 +34,13 @@ export type WebScreenshotArtifact = z.infer<typeof webScreenshotArtifactSchema>;
 
 /** Input for one read-only visible-viewport screenshot. */
 export const captureWebScreenshotInputSchema = z.strictObject({
-  cdp_endpoint: browserEndpointSchema,
+  cdp_endpoint: browserObservationEndpointSchema,
   allowed_origins: browserAllowedOriginsSchema,
   target_id: z.string().trim().min(1),
 });
 export type CaptureWebScreenshotInput = z.infer<
   typeof captureWebScreenshotInputSchema
 >;
-
-const browserVersionSchema = z.object({
-  product: z.string(),
-  protocol_version: z.string(),
-  revision: z.string(),
-  user_agent: z.string(),
-  js_version: z.string(),
-});
 
 /** Screenshot observation with embedded immutable artifact bytes. */
 export const webScreenshotSchema = z.object({

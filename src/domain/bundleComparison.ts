@@ -10,6 +10,8 @@ import {
 import type { ResidualUnknown } from "./residualUnknown.js";
 import { digestSchema } from "./../domain/digests.js";
 import { prefixedDigestSchema } from "./../domain/digests.js";
+import { comparisonStatusSchema } from "./comparisonStatus.js";
+import { localPathStringSchema } from "./localPath.js";
 
 const evidenceIdSchema = prefixedDigestSchema("ev");
 const classificationSchema = z.enum([
@@ -23,8 +25,8 @@ const classificationSchema = z.enum([
 
 /** Strict input for canonical Evidence bundle comparison. */
 export const bundleComparisonInputSchema = z.strictObject({
-  left_bundle_path: z.string().min(1),
-  right_bundle_path: z.string().min(1),
+  left_bundle_path: localPathStringSchema,
+  right_bundle_path: localPathStringSchema,
   record_pairs: z
     .array(
       z.object({
@@ -53,7 +55,7 @@ const bundleChangeSchema = z.object({
 
 /** Deterministic classified delta between two canonical Evidence bundles. */
 export const bundleComparisonResultSchema = z.object({
-  status: z.enum(["unchanged", "changed", "unknown"]),
+  status: comparisonStatusSchema,
   left_bundle_sha256: digestSchema,
   right_bundle_sha256: digestSchema,
   summary: z.object({
@@ -100,11 +102,7 @@ export const compareBundles = (
   ).length;
   return bundleComparisonResultSchema.parse({
     status:
-      leftDigest === rightDigest && changes.length === 0
-        ? "unchanged"
-        : unresolved > 0
-          ? "unknown"
-          : "changed",
+      unresolved > 0 ? "unknown" : changes.length > 0 ? "changed" : "unchanged",
     left_bundle_sha256: leftDigest,
     right_bundle_sha256: rightDigest,
     summary: {

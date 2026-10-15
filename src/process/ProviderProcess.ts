@@ -6,8 +6,14 @@ import { WindowsOwnedProcess } from "../windows/WindowsOwnedProcess.js";
 
 import type {
   OwnedProcessGroup,
+  ProcessOwnershipBaseline,
+  ProcessCleanupFailure,
   ProcessCleanupResult,
 } from "./ProcessOwnership.js";
+import {
+  prepareProcessOwnershipInspection,
+  systemProcessOwnershipHost,
+} from "./ProcessOwnershipObservation.js";
 
 const DEFAULT_TERMINATION_GRACE_MS = 250;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -29,6 +35,15 @@ export interface OwnedProviderProcessSpawnOptions {
   readonly hostEnvironment?: NodeJS.ProcessEnv;
   /** Opt into a writable protocol stream; other providers retain ignored stdin. */
   readonly stdin?: "pipe";
+  /**
+   * Commit limit in bytes for the whole owned process tree, enforced by its
+   * Windows Job Object. Other launchers cannot enforce it and refuse it.
+   */
+  readonly memoryLimitBytes?: number;
+  /** Sweep exact run-token descendants during POSIX cleanup. */
+  readonly sweepTokenOwnedProcesses?: boolean;
+  /** Cancels native ownership preparation before provider process creation. */
+  readonly signal?: AbortSignal;
 }
 
 /** Spawned process paired with the identity proof required for group cleanup. */
@@ -49,7 +64,13 @@ export interface ProviderProcessHandle extends Pick<
   readonly stderr: Readable | null;
   readonly exitCode: number | null;
   readonly signalCode: NodeJS.Signals | null;
+  /** True once an enforced process memory limit reported an allocation failure. */
+  readonly memoryLimitReached?: boolean;
+  /** True if a Windows backpressured stream was destroyed before output drained. */
+  readonly outputIncomplete?: boolean;
   kill(signal?: NodeJS.Signals | number): boolean;
+  unref?(): void;
+  ref?(): void;
 }
 
 /** Process handle returned by a provider-specific launcher. */
@@ -67,18 +88,42 @@ export type ProviderProcessLaunch =
       readonly cleanup?: () => Promise<ProcessCleanupResult>;
     };
 
+/**
+ * Process exit recorded by the supervisor.
+ * Independent of retained stream diagnostics.
+ */
+export interface ProviderProcessExitObservation {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+}
+
 /** Detached diagnostics captured for one supervised provider process. */
 export interface ProviderProcessSnapshot {
+  /** True when retained diagnostics omit bytes due to the budget or provider output loss. */
+  readonly diagnosticTruncated?: boolean;
   readonly stdout: {
     readonly text: string;
+    /** True when retained bytes cannot be represented exactly as UTF-8 text. */
+    readonly invalidUtf8?: true;
+    /** Bytes retained in text, limited by maxDiagnosticBytes when configured. */
     readonly bytes: number;
+    /** All bytes drained from this stream since construction or resetOutput. */
+    readonly observedBytes: number;
   };
   readonly stderr: {
     readonly text: string;
+    /** True when retained bytes cannot be represented exactly as UTF-8 text. */
+    readonly invalidUtf8?: true;
+    /** Bytes retained in text, limited by maxDiagnosticBytes when configured. */
     readonly bytes: number;
+    readonly observedBytes: number;
   };
   readonly exitCode: number | null | undefined;
   readonly signal: NodeJS.Signals | null | undefined;
+  /** Present only when the process tree reached its enforced memory limit. */
+  readonly memoryLimitReached?: true;
+  /** Present when a provider stream was destroyed before all bytes were observed. */
+  readonly outputIncomplete?: true;
 }
 
 /** Resource-safe events emitted without imposing provider protocol semantics. */
@@ -88,6 +133,7 @@ export type ProviderProcessDiagnostic =
       readonly stream: "stdout" | "stderr";
       readonly bytes: number;
       readonly totalBytes: number;
+      readonly truncated?: boolean;
     }
   | {
       readonly type: "exit";
@@ -99,6 +145,10 @@ export type ProviderProcessDiagnostic =
 
 /** Options for process lifecycle diagnostics. */
 export interface ProviderProcessSupervisorOptions {
+  /** Retain stdout for diagnostics; disable when it carries a parsed protocol. Defaults to true. */
+  readonly captureStdout?: boolean;
+  /** Aggregate retained stdout/stderr byte budget; overflow is drained and reported, not retained. */
+  readonly maxDiagnosticBytes?: number;
   readonly onDiagnostic?: (event: ProviderProcessDiagnostic) => void;
 }
 
@@ -119,7 +169,11 @@ export type ProviderProcessStopResult =
         | "terminated"
         | "killed";
     }
-  | { readonly status: "incomplete"; readonly reason: string };
+  | {
+      readonly status: "incomplete";
+      readonly reason: string;
+      readonly cleanupResult?: ProcessCleanupFailure;
+    };
 
 /**
  * Spawn a provider in an owned Windows job or dedicated POSIX process group.
@@ -130,7 +184,20 @@ export type ProviderProcessStopResult =
 export const spawnOwnedProviderProcess = async (
   options: OwnedProviderProcessSpawnOptions,
 ): Promise<SpawnedOwnedProviderProcess> => {
+  options.signal?.throwIfAborted();
+  await prepareProcessOwnershipInspection(options.signal);
+  options.signal?.throwIfAborted();
   const platform = options.platform ?? process.platform;
+  const sweepTokenOwnedProcesses =
+    options.sweepTokenOwnedProcesses === true && platform !== "win32";
+  let captureBaseline: ProcessOwnershipBaseline | undefined;
+  if (sweepTokenOwnedProcesses) {
+    const capture = systemProcessOwnershipHost.captureBaseline;
+    if (capture === undefined)
+      throw new Error("Process ownership baseline is unavailable on this host");
+    captureBaseline = await capture(options.signal);
+    options.signal?.throwIfAborted();
+  }
   const hostEnvironment = options.hostEnvironment ?? process.env;
   const environment = {
     ...hostEnvironment,
@@ -138,16 +205,18 @@ export const spawnOwnedProviderProcess = async (
     REA_PROCESS_RUN_ID: options.runId,
   };
   if (platform === "win32" && process.platform === "win32") {
-    if (options.stdin === "pipe")
-      throw new Error(
-        "Owned Windows provider processes do not support protocol stdin",
-      );
     const child = new WindowsOwnedProcess(
       options.command,
       options.arguments,
       options.cwd,
       environment,
       options.windowsVerbatimArguments ?? false,
+      {
+        protocolStdin: options.stdin === "pipe",
+        ...(options.memoryLimitBytes === undefined
+          ? {}
+          : { memoryLimitBytes: options.memoryLimitBytes }),
+      },
     );
     return {
       process: child,
@@ -160,6 +229,10 @@ export const spawnOwnedProviderProcess = async (
       cleanup: () => child.cleanup(),
     };
   }
+  if (options.memoryLimitBytes !== undefined)
+    throw new Error(
+      "Owned process memory limits require the Windows Job Object launcher; no limit can be enforced on this host.",
+    );
   const child = spawn(options.command, [...options.arguments], {
     shell: false,
     windowsHide: true,
@@ -177,6 +250,12 @@ export const spawnOwnedProviderProcess = async (
     leaderPid: pid,
     processGroupId: pid,
     expectedParentPid: process.pid,
+    ...(sweepTokenOwnedProcesses
+      ? {
+          sweepTokenOwnedProcesses: true,
+          captureBaseline: captureBaseline!,
+        }
+      : {}),
     ...(options.expectedCommand === null
       ? {}
       : { expectedCommand: options.expectedCommand ?? options.command }),
@@ -187,7 +266,7 @@ export const spawnOwnedProviderProcess = async (
 /**
  * Supervises only generic process resources; wire protocol remains adapter-owned.
  *
- * Output retention is bounded per stream while byte totals remain exact. Stop
+ * Output retention is complete per stream; adapters own resource budgets. Stop
  * first honors token-verified group cleanup when supplied, otherwise it uses a
  * bounded TERM-to-KILL escalation for a directly owned child.
  */
@@ -195,15 +274,23 @@ export class ProviderProcessSupervisor {
   readonly #options: ProviderProcessSupervisorOptions;
   readonly #stdout = new ProcessOutputCapture();
   readonly #stderr = new ProcessOutputCapture();
-  readonly #exit = deferred<{
-    readonly code: number | null;
-    readonly signal: NodeJS.Signals | null;
-  }>();
+  readonly #exit = deferred<ProviderProcessExitObservation>();
+  readonly #outputClose = deferred<void>();
+  #outputClosed = false;
+  #stdoutObservedBytes = 0;
+  #stderrObservedBytes = 0;
+  #diagnosticTruncated = false;
   readonly #onStdout = (chunk: Buffer | string): void => {
     this.#capture("stdout", this.#stdout, chunk);
   };
   readonly #onStderr = (chunk: Buffer | string): void => {
     this.#capture("stderr", this.#stderr, chunk);
+  };
+  readonly #onStdoutError = (cause: Error): void => {
+    this.#recordStreamError("stdout", cause);
+  };
+  readonly #onStderrError = (cause: Error): void => {
+    this.#recordStreamError("stderr", cause);
   };
   readonly #onExit = (
     code: number | null,
@@ -216,22 +303,25 @@ export class ProviderProcessSupervisor {
     signal: NodeJS.Signals | null,
   ): void => {
     this.#recordExit(code, signal);
+    this.#outputClosed = true;
+    this.#outputClose.resolve(undefined);
   };
   readonly #onError = (cause: Error): void => {
     this.#options.onDiagnostic?.({ type: "error", message: cause.message });
   };
-  #exitObservation:
-    | { readonly code: number | null; readonly signal: NodeJS.Signals | null }
-    | undefined;
+  #exitObservation: ProviderProcessExitObservation | undefined;
   #stopPromise: Promise<ProviderProcessStopResult> | undefined;
   #disposed = false;
+  #maxDiagnosticBytes: number | undefined;
 
   constructor(
     readonly launch: ProviderProcessLaunch,
     options: ProviderProcessSupervisorOptions = {},
   ) {
     this.#options = options;
-    this.#attach(launch.process.stdout, "stdout");
+    this.#maxDiagnosticBytes = options.maxDiagnosticBytes;
+    if (options.captureStdout !== false)
+      this.#attach(launch.process.stdout, "stdout");
     this.#attach(launch.process.stderr, "stderr");
     launch.process.once("exit", this.#onExit);
     launch.process.once("close", this.#onClose);
@@ -240,37 +330,98 @@ export class ProviderProcessSupervisor {
       this.#recordExit(launch.process.exitCode, launch.process.signalCode);
   }
 
-  /** Latest complete output and exit observation. */
+  /**
+   * Recorded process exit without concatenating retained stream diagnostics.
+   * Undefined until exit or close is observed.
+   */
+  observedExit(): ProviderProcessExitObservation | undefined {
+    const exit = this.#exitObservation;
+    if (exit === undefined) return undefined;
+    return { code: exit.code, signal: exit.signal };
+  }
+
+  /** Latest retained output and exit observation, with explicit configured truncation. */
   snapshot(): ProviderProcessSnapshot {
+    const outputIncomplete = this.launch.process.outputIncomplete === true;
     return {
-      stdout: this.#stdout.snapshot(),
-      stderr: this.#stderr.snapshot(),
+      ...(this.#diagnosticTruncated || outputIncomplete
+        ? { diagnosticTruncated: true }
+        : {}),
+      stdout: this.#stdout.snapshot(this.#stdoutObservedBytes),
+      stderr: this.#stderr.snapshot(this.#stderrObservedBytes),
       exitCode: this.#exitObservation?.code,
       signal: this.#exitObservation?.signal,
+      ...(this.launch.process.memoryLimitReached === true
+        ? { memoryLimitReached: true }
+        : {}),
+      ...(outputIncomplete ? { outputIncomplete: true } : {}),
     };
+  }
+
+  /** Begin a new observation on a retained process without retaining earlier output. */
+  resetOutput(): void {
+    this.#stdout.reset();
+    this.#stderr.reset();
+    this.#stdoutObservedBytes = 0;
+    this.#stderrObservedBytes = 0;
+    this.#diagnosticTruncated = false;
   }
 
   /** Wait for process exit up to a caller-owned bounded interval. */
   async waitForExit(timeoutMs: number): Promise<boolean> {
-    if (this.#exitObservation !== undefined) return true;
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      return await Promise.race([
-        this.#exit.promise.then(() => true),
-        new Promise<boolean>((resolve) => {
-          timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
-        }),
-      ]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
+    return waitForProcessEvent(
+      this.#exitObservation !== undefined,
+      this.#exit.promise,
+      timeoutMs,
+    );
+  }
+
+  /** Wait until output streams close; WindowsOwnedProcess closes only after its whole Job Object settles. */
+  async waitForOutputClose(timeoutMs: number): Promise<boolean> {
+    return waitForProcessEvent(
+      this.#outputClosed,
+      this.#outputClose.promise,
+      timeoutMs,
+    );
+  }
+
+  /** Bound additional retained bytes while still draining all later output. */
+  limitAdditionalOutputBytes(maxBytes: number): void {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0)
+      throw new RangeError(
+        "Additional output limit must be a non-negative safe integer.",
+      );
+    const retained = this.#stdout.bytes + this.#stderr.bytes;
+    const requestedLimit = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      retained + maxBytes,
+    );
+    this.#maxDiagnosticBytes =
+      this.#maxDiagnosticBytes === undefined
+        ? requestedLimit
+        : Math.min(this.#maxDiagnosticBytes, requestedLimit);
+  }
+
+  /** Unreference inherited output pipes without closing streams shared with descendants. */
+  unrefOutputStreams(): void {
+    for (const stream of [
+      this.launch.process.stdout,
+      this.launch.process.stderr,
+    ]) {
+      const unref = (stream as (Readable & { unref?: () => void }) | null)
+        ?.unref;
+      unref?.call(stream);
     }
   }
 
-  /** Stop an owned process once; concurrent callers share the same escalation. */
+  /** Share each stop attempt; incomplete cleanup retains ownership and permits retry. */
   stop(
     options: ProviderProcessStopOptions = {},
   ): Promise<ProviderProcessStopResult> {
-    this.#stopPromise ??= this.#stop(options);
+    this.#stopPromise ??= this.#stop(options).then((result) => {
+      if (result.status === "incomplete") this.#stopPromise = undefined;
+      return result;
+    });
     return this.#stopPromise;
   }
 
@@ -279,13 +430,48 @@ export class ProviderProcessSupervisor {
     if (this.#disposed) return;
     this.#disposed = true;
     this.launch.process.stdout?.off("data", this.#onStdout);
+    this.launch.process.stdout?.off("error", this.#onStdoutError);
     this.launch.process.stderr?.off("data", this.#onStderr);
+    this.launch.process.stderr?.off("error", this.#onStderrError);
     this.launch.process.off("exit", this.#onExit);
     this.launch.process.off("close", this.#onClose);
     this.launch.process.off("error", this.#onError);
   }
 
+  /** Release event-loop references so incomplete cleanup does not prevent host exit. */
+  unref(): void {
+    const process = this.launch.process;
+    process.unref?.();
+    (process.stdin as { unref?: () => void } | null | undefined)?.unref?.();
+    (process.stdout as { unref?: () => void } | null | undefined)?.unref?.();
+    (process.stderr as { unref?: () => void } | null | undefined)?.unref?.();
+  }
+
+  /** Restore event-loop references when retrying supervised process cleanup. */
+  ref(): void {
+    const process = this.launch.process;
+    process.ref?.();
+    (process.stdin as { ref?: () => void } | null | undefined)?.ref?.();
+    (process.stdout as { ref?: () => void } | null | undefined)?.ref?.();
+    (process.stderr as { ref?: () => void } | null | undefined)?.ref?.();
+  }
+
   async #stop(
+    options: ProviderProcessStopOptions,
+  ): Promise<ProviderProcessStopResult> {
+    this.ref();
+    let completed = false;
+    try {
+      const result = await this.#stopWithin(options);
+      completed = result.status !== "incomplete";
+      if (!completed) this.unref();
+      return result;
+    } finally {
+      if (completed) this.dispose();
+    }
+  }
+
+  async #stopWithin(
     options: ProviderProcessStopOptions,
   ): Promise<ProviderProcessStopResult> {
     try {
@@ -293,13 +479,21 @@ export class ProviderProcessSupervisor {
       if (this.launch.cleanup !== undefined) {
         const cleanup = await this.#ownedCleanup(options.cleanupResult);
         if (!cleanup.cleaned)
-          return { status: "incomplete", reason: cleanup.reason };
+          return {
+            status: "incomplete",
+            reason: cleanup.reason,
+            cleanupResult: cleanup,
+          };
         const graceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
         if (await this.waitForExit(graceMs))
           return { status: "verified-cleanup" };
         const retried = await this.launch.cleanup();
         if (!retried.cleaned)
-          return { status: "incomplete", reason: retried.reason };
+          return {
+            status: "incomplete",
+            reason: retried.reason,
+            cleanupResult: retried,
+          };
         if (await this.waitForExit(graceMs))
           return { status: "verified-cleanup" };
         return {
@@ -333,8 +527,6 @@ export class ProviderProcessSupervisor {
             ? cause.message
             : "owned provider process cleanup failed",
       };
-    } finally {
-      this.dispose();
     }
   }
 
@@ -357,8 +549,20 @@ export class ProviderProcessSupervisor {
   }
 
   #attach(stream: Readable | null, name: "stdout" | "stderr"): void {
-    if (name === "stdout") stream?.on("data", this.#onStdout);
-    else stream?.on("data", this.#onStderr);
+    if (name === "stdout") {
+      stream?.on("data", this.#onStdout);
+      stream?.on("error", this.#onStdoutError);
+    } else {
+      stream?.on("data", this.#onStderr);
+      stream?.on("error", this.#onStderrError);
+    }
+  }
+
+  #recordStreamError(stream: "stdout" | "stderr", cause: Error): void {
+    this.#options.onDiagnostic?.({
+      type: "error",
+      message: `${stream} stream failed: ${cause.message}`,
+    });
   }
 
   #capture(
@@ -367,12 +571,27 @@ export class ProviderProcessSupervisor {
     chunk: Buffer | string,
   ): void {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    capture.append(bytes);
+    if (stream === "stdout") this.#stdoutObservedBytes += bytes.byteLength;
+    else this.#stderrObservedBytes += bytes.byteLength;
+    const remaining =
+      this.#maxDiagnosticBytes === undefined
+        ? bytes.byteLength
+        : Math.max(
+            0,
+            this.#maxDiagnosticBytes - this.#stdout.bytes - this.#stderr.bytes,
+          );
+    const retained = Math.min(bytes.byteLength, remaining);
+    if (retained < bytes.byteLength) this.#diagnosticTruncated = true;
+    if (retained > 0) capture.append(bytes.subarray(0, retained));
     this.#options.onDiagnostic?.({
       type: "output",
       stream,
       bytes: bytes.byteLength,
-      totalBytes: capture.bytes,
+      totalBytes:
+        stream === "stdout"
+          ? this.#stdoutObservedBytes
+          : this.#stderrObservedBytes,
+      ...(retained < bytes.byteLength ? { truncated: true } : {}),
     });
   }
 
@@ -397,16 +616,30 @@ class ProcessOutputCapture {
     return this.#bytes;
   }
 
+  reset(): void {
+    this.#chunks.length = 0;
+    this.#bytes = 0;
+  }
+
   append(chunk: Buffer): void {
     this.#bytes += chunk.byteLength;
     this.#chunks.push(Buffer.from(chunk));
   }
 
-  snapshot(): ProviderProcessSnapshot["stdout"] {
-    const text = Buffer.concat(this.#chunks, this.#bytes).toString("utf8");
+  snapshot(observedBytes: number): ProviderProcessSnapshot["stdout"] {
+    const buffer = Buffer.concat(this.#chunks, this.#bytes);
+    const text = buffer.toString("utf8");
+    let invalidUtf8 = false;
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+    } catch {
+      invalidUtf8 = true;
+    }
     return {
       text,
       bytes: this.#bytes,
+      observedBytes,
+      ...(invalidUtf8 ? { invalidUtf8: true } : {}),
     };
   }
 }
@@ -442,3 +675,22 @@ const waitForSpawn = (child: ChildProcess): Promise<void> =>
     child.once("spawn", onSpawn);
     child.once("error", onError);
   });
+
+const waitForProcessEvent = async (
+  observed: boolean,
+  event: Promise<unknown>,
+  timeoutMs: number,
+): Promise<boolean> => {
+  if (observed) return true;
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      event.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+};

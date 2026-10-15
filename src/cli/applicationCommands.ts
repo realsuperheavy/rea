@@ -1,31 +1,22 @@
+import { reconstructionCoverageEvaluationInputSchema } from "../domain/reconstructionCoverageInput.js";
 import { Cli, z } from "incur";
 
-import {
-  compareApplicationVersionsEvidenceValidated,
-  compareJavaScriptExportShapesEvidenceValidated,
-  compareSourceToBundleEvidenceValidated,
-  traceApplicationFeatureEvidenceValidated,
-} from "../application/JavaScriptApplicationWorkflowService.js";
-import { traceJavaScriptSemanticsEvidenceValidated } from "../application/JavaScriptSemanticTraceService.js";
-import {
-  evaluateReconstructionCoverage,
-  reconstructionCoverageEvaluationInputSchema,
-} from "../application/ReconstructionCoverageService.js";
-import { buildReconstructionObligationLedgerEvidenceValidated } from "../application/ReconstructionObligationLedgerService.js";
 import { CLI_COMMANDS } from "../cliCommandNames.js";
 import { parseCliJsonInput } from "../cliJsonInput.js";
 import { logCliCommand } from "../cliLogging.js";
-import { AnalysisInputError } from "../domain/analysisErrorCore.js";
 import { projectAnalysisError } from "../domain/analysisErrorProjection.js";
-import { type AnalysisError } from "../domain/analysisErrorBase.js";
+import type { AnalysisError } from "../domain/analysisErrorBase.js";
+import { androidApplicationProjectionInputSchema } from "../domain/android/androidApplication.js";
+import { appleApplicationProjectionInputSchema } from "../domain/apple/appleApplication.js";
+import { harmonyApplicationProjectionInputSchema } from "../domain/harmony/harmonyApplication.js";
 import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
-import type { Logger } from "../logger.js";
-import { traceApplicationFeatureInputSchema } from "../domain/javascriptFeatureTraceSchemas.js";
-import { traceJavaScriptSemanticsInputSchema } from "../domain/javascriptSemanticTraceSchemas.js";
-import { compareApplicationVersionsInputSchema } from "../domain/javascriptApplicationVersionComparisonSchemas.js";
-import { compareSourceToBundleInputSchema } from "../domain/sourceToBundleComparisonSchemas.js";
-import { compareJavaScriptExportShapesInputSchema } from "../domain/javascriptExportShapeComparisonSchemas.js";
-import { projectInputIssues } from "../domain/inputIssueProjection.js";
+import type { Logger } from "pino";
+import { traceApplicationFeatureInputSchema } from "../domain/javascript/javascriptFeatureTraceSchemas.js";
+import { traceJavaScriptSemanticsInputSchema } from "../domain/javascript/javascriptSemanticTraceSchemas.js";
+import { compareApplicationVersionsInputSchema } from "../domain/javascript/javascriptApplicationVersionComparisonSchemas.js";
+import { compareSourceToBundleInputSchema } from "../domain/javascript/sourceToBundleComparisonSchemas.js";
+import { compareJavaScriptExportShapesInputSchema } from "../domain/javascript/javascriptExportShapeComparisonSchemas.js";
+import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import { reconstructionObligationLedgerInputSchema } from "../domain/reconstructionObligationLedgerSchemas.js";
 
 type CliInstance = ReturnType<typeof Cli.create>;
@@ -42,7 +33,11 @@ export const registerApplicationCommands = (
     description:
       "Trace a typed seed through authenticated application Evidence JSON",
     inputSchema: traceApplicationFeatureInputSchema,
-    workflow: traceApplicationFeatureEvidenceValidated,
+    workflow: async (input) => {
+      const { traceApplicationFeatureEvidenceValidated } =
+        await import("../application/javascript/JavaScriptApplicationWorkflowService.js");
+      return traceApplicationFeatureEvidenceValidated(input);
+    },
   });
   registerJsonCommand({
     cli,
@@ -51,7 +46,11 @@ export const registerApplicationCommands = (
     description:
       "Trace bounded static semantic relations through authenticated application Evidence",
     inputSchema: traceJavaScriptSemanticsInputSchema,
-    workflow: traceJavaScriptSemanticsEvidenceValidated,
+    workflow: async (input) => {
+      const { traceJavaScriptSemanticsEvidenceValidated } =
+        await import("../application/javascript/JavaScriptSemanticTraceService.js");
+      return traceJavaScriptSemanticsEvidenceValidated(input);
+    },
   });
   registerJsonCommand({
     cli,
@@ -60,7 +59,11 @@ export const registerApplicationCommands = (
     description:
       "Compare two authenticated JavaScript Application Graph versions",
     inputSchema: compareApplicationVersionsInputSchema,
-    workflow: compareApplicationVersionsEvidenceValidated,
+    workflow: async (input) => {
+      const { compareApplicationVersionsEvidenceValidated } =
+        await import("../application/javascript/JavaScriptApplicationWorkflowService.js");
+      return compareApplicationVersionsEvidenceValidated(input);
+    },
   });
   registerJsonCommand({
     cli,
@@ -69,7 +72,11 @@ export const registerApplicationCommands = (
     description:
       "Compare committed historical source with authenticated application Evidence",
     inputSchema: compareSourceToBundleInputSchema,
-    workflow: compareSourceToBundleEvidenceValidated,
+    workflow: async (input) => {
+      const { compareSourceToBundleEvidenceValidated } =
+        await import("../application/javascript/JavaScriptApplicationWorkflowService.js");
+      return compareSourceToBundleEvidenceValidated(input);
+    },
   });
   registerJsonCommand({
     cli,
@@ -78,10 +85,62 @@ export const registerApplicationCommands = (
     description:
       "Compare exact static JavaScript export return shapes without execution",
     inputSchema: compareJavaScriptExportShapesInputSchema,
-    workflow: compareJavaScriptExportShapesEvidenceValidated,
+    workflow: async (input) => {
+      const { compareJavaScriptExportShapesEvidenceValidated } =
+        await import("../application/javascript/JavaScriptApplicationWorkflowService.js");
+      return compareJavaScriptExportShapesEvidenceValidated(input);
+    },
   });
   registerObligationLedgerCommand(cli, logger);
   registerCoverageCommand(cli, logger);
+  registerJsonCommand({
+    cli,
+    logger,
+    name: CLI_COMMANDS.projectAndroidApplicationGraph,
+    description:
+      "Project authenticated APK inventory Evidence into an Android application graph",
+    inputSchema: androidApplicationProjectionInputSchema,
+    workflow: async (input) => {
+      const { projectAndroidApplicationEvidence } =
+        await import("../application/android/AndroidApplicationService.js");
+      const result = projectAndroidApplicationEvidence(input);
+      return result.ok
+        ? { ok: true, value: jsonValueSchema.parse(result.value) }
+        : result;
+    },
+  });
+  registerJsonCommand({
+    cli,
+    logger,
+    name: CLI_COMMANDS.projectAppleApplicationGraph,
+    description:
+      "Project authenticated IPA or macOS app inventory Evidence into an Apple application graph",
+    inputSchema: appleApplicationProjectionInputSchema,
+    workflow: async (input) => {
+      const { projectAppleApplicationEvidence } =
+        await import("../application/apple/AppleApplicationService.js");
+      const result = projectAppleApplicationEvidence(input);
+      return result.ok
+        ? { ok: true, value: jsonValueSchema.parse(result.value) }
+        : result;
+    },
+  });
+  registerJsonCommand({
+    cli,
+    logger,
+    name: CLI_COMMANDS.projectHarmonyApplicationGraph,
+    description:
+      "Project authenticated HarmonyOS HAP, HSP, or App Pack inventory Evidence into an application graph",
+    inputSchema: harmonyApplicationProjectionInputSchema,
+    workflow: async (input) => {
+      const { projectHarmonyApplicationEvidence } =
+        await import("../application/harmony/HarmonyApplicationService.js");
+      const result = projectHarmonyApplicationEvidence(input);
+      return result.ok
+        ? { ok: true, value: jsonValueSchema.parse(result.value) }
+        : result;
+    },
+  });
 };
 
 const registerObligationLedgerCommand = (
@@ -95,7 +154,9 @@ const registerObligationLedgerCommand = (
     description:
       "Generate a deterministic Evidence-backed reconstruction obligation ledger page",
     inputSchema: reconstructionObligationLedgerInputSchema,
-    workflow: (input) => {
+    workflow: async (input) => {
+      const { buildReconstructionObligationLedgerEvidenceValidated } =
+        await import("../application/ReconstructionObligationLedgerService.js");
       const result =
         buildReconstructionObligationLedgerEvidenceValidated(input);
       return result.ok
@@ -111,7 +172,9 @@ const registerCoverageCommand = (cli: CliInstance, logger: Logger): void =>
     name: CLI_COMMANDS.evaluateReconstructionCoverage,
     description: "Evaluate inline fail-closed reconstruction coverage",
     inputSchema: reconstructionCoverageEvaluationInputSchema,
-    workflow: (input) => {
+    workflow: async (input) => {
+      const { evaluateReconstructionCoverage } =
+        await import("../application/ReconstructionCoverageService.js");
       const result = evaluateReconstructionCoverage(input);
       return result.ok
         ? { ok: true, value: jsonValueSchema.parse(result.value) }
@@ -127,9 +190,10 @@ interface JsonCommandOptions<Schema extends z.ZodType> {
   readonly inputSchema: Schema;
   readonly workflow: (
     input: z.output<Schema>,
-  ) =>
+  ) => Promise<
     | { readonly ok: true; readonly value: JsonValue }
-    | { readonly ok: false; readonly error: AnalysisError };
+    | { readonly ok: false; readonly error: AnalysisError }
+  >;
 }
 
 const registerJsonCommand = <Schema extends z.ZodType>({
@@ -154,14 +218,14 @@ const registerJsonCommand = <Schema extends z.ZodType>({
           return {
             error: "Application workflow failed",
             ...projectAnalysisError(
-              new AnalysisInputError(
+              analysisInputErrorFromIssues(
                 name,
-                undefined,
-                projectInputIssues(parsed.error.issues, input.value),
+                parsed.error.issues,
+                input.value,
               ),
             ),
           };
-        const result = workflow(parsed.data);
+        const result = await workflow(parsed.data);
         return result.ok
           ? result.value
           : {

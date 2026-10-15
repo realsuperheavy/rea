@@ -5,6 +5,7 @@ import {
   type Transport,
 } from "@modelcontextprotocol/client";
 import { randomUUID } from "node:crypto";
+import { finished } from "node:stream/promises";
 import type {
   OwnedProviderProcessSpawnOptions,
   SpawnedOwnedProviderProcess,
@@ -17,9 +18,9 @@ import { cleanupOwnedProcessGroup } from "../process/ProcessOwnership.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
 
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
-const MAX_SESSION_BYTES = 32 * 1024 * 1024;
+const MAX_OPERATION_BYTES = 32 * 1024 * 1024;
 
-/** Injectable process acquisition seam; the production launcher owns a POSIX group. */
+/** Injectable acquisition seam; production owns a POSIX group or Windows job. */
 export type JadxLauncher = (
   options: OwnedProviderProcessSpawnOptions,
 ) => Promise<SpawnedOwnedProviderProcess>;
@@ -32,7 +33,8 @@ export class JadxMcpTransport implements Transport {
   readonly runId = randomUUID();
   #spawned: SpawnedOwnedProviderProcess | undefined;
   #supervisor: ProviderProcessSupervisor | undefined;
-  #buffer = Buffer.alloc(0);
+  #frameBuffer = Buffer.alloc(0);
+  #frameLength = 0;
   #bytes = 0;
   #started = false;
   #closed = false;
@@ -61,12 +63,16 @@ export class JadxMcpTransport implements Transport {
       stdin: "pipe",
     });
     this.#spawned = spawned;
-    this.#supervisor = new ProviderProcessSupervisor({
-      ...spawned,
-      ownsProcessLifetime: true,
-      cleanup:
-        spawned.cleanup ?? (() => cleanupOwnedProcessGroup(spawned.ownership)),
-    });
+    this.#supervisor = new ProviderProcessSupervisor(
+      {
+        ...spawned,
+        ownsProcessLifetime: true,
+        cleanup:
+          spawned.cleanup ??
+          (() => cleanupOwnedProcessGroup(spawned.ownership)),
+      },
+      { captureStdout: false },
+    );
     if (
       spawned.process.stdin === undefined ||
       spawned.process.stdin === null ||
@@ -95,7 +101,10 @@ export class JadxMcpTransport implements Transport {
 
   /** Verifies owned process exit before declaring the transport closed. */
   close(): Promise<void> {
-    this.#closePromise ??= this.#stop();
+    this.#closePromise ??= this.#stop().catch((cause: unknown) => {
+      this.#closePromise = undefined;
+      throw cause;
+    });
     return this.#closePromise;
   }
 
@@ -104,13 +113,26 @@ export class JadxMcpTransport implements Transport {
     return this.#supervisor?.snapshot().stderr.text ?? "";
   }
 
+  /** Whether the retained startup/operation diagnostics lost bytes. */
+  diagnosticsTruncated(): boolean {
+    return this.#supervisor?.snapshot().diagnosticTruncated ?? false;
+  }
+
   /** Preserve the failed protocol/resource constraint after the SDK closes requests. */
   failureReason(): string | null {
     return this.#failure;
   }
 
+  /** Scope both the byte budget and diagnostic retention to the next serialized request. */
+  beginOperation(): void {
+    this.#bytes = 0;
+    this.#supervisor?.resetOutput();
+  }
+
   async #stop(): Promise<void> {
     this.#closed = true;
+    this.#frameBuffer = Buffer.alloc(0);
+    this.#frameLength = 0;
     // A cancellation may race acquisition. Join it before inspecting ownership.
     await this.#starting?.catch(() => undefined);
     const process = this.#spawned?.process;
@@ -118,8 +140,19 @@ export class JadxMcpTransport implements Transport {
     process?.stderr?.off("data", this.#countStderr);
     process?.off("error", this.#error);
     process?.off("exit", this.#exit);
-    process?.stdin?.off("error", this.#error);
+    const input = process?.stdin;
+    // A job termination can complete an in-flight pipe write asynchronously.
+    // Observe its errors until the owned Writable has finished closing.
+    const inputClosed =
+      input === undefined || input === null
+        ? undefined
+        : finished(input, { readable: false, cleanup: true }).catch(
+            () => undefined,
+          );
     const stopped = await this.#supervisor?.stop();
+    input?.destroy();
+    await inputClosed;
+    input?.off("error", this.#error);
     this.onclose?.();
     if (stopped?.status === "incomplete")
       throw new ProviderCleanupError("jadx", [this.runId], {
@@ -136,10 +169,10 @@ export class JadxMcpTransport implements Transport {
   };
   readonly #countStderr = (chunk: Buffer | string): void => {
     this.#bytes += Buffer.byteLength(chunk);
-    if (this.#bytes > MAX_SESSION_BYTES)
+    if (this.#bytes > MAX_OPERATION_BYTES)
       this.#fail(
         new Error(
-          `JADX session output exceeds ${MAX_SESSION_BYTES} bytes; no complete result is available`,
+          `JADX operation output exceeds ${MAX_OPERATION_BYTES} bytes; no complete result is available`,
         ),
       );
   };
@@ -147,30 +180,52 @@ export class JadxMcpTransport implements Transport {
     if (this.#closed) return;
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     this.#bytes += bytes.length;
-    if (this.#bytes > MAX_SESSION_BYTES) {
+    if (this.#bytes > MAX_OPERATION_BYTES) {
       this.#fail(
         new Error(
-          `JADX session output exceeds ${MAX_SESSION_BYTES} bytes; no complete result is available`,
+          `JADX operation output exceeds ${MAX_OPERATION_BYTES} bytes; no complete result is available`,
         ),
       );
       return;
     }
-    this.#buffer = Buffer.concat([this.#buffer, bytes]);
     try {
-      let newline: number;
-      while ((newline = this.#buffer.indexOf(10)) !== -1) {
-        if (newline > MAX_FRAME_BYTES)
+      let offset = 0;
+      while (offset < bytes.length) {
+        const newline = bytes.indexOf(10, offset);
+        const end = newline === -1 ? bytes.length : newline;
+        const fragment = bytes.subarray(offset, end);
+        const frameBytes = this.#frameLength + fragment.length;
+        if (frameBytes > MAX_FRAME_BYTES)
           throw new Error(`JADX MCP frame exceeds ${MAX_FRAME_BYTES} bytes`);
-        const line = this.#buffer.subarray(0, newline).toString("utf8");
-        this.#buffer = this.#buffer.subarray(newline + 1);
+        this.#appendFrame(fragment, frameBytes);
+        if (newline === -1) return;
+        const line = new TextDecoder("utf-8", {
+          fatal: true,
+          // Preserve a leading BOM so the JSON-RPC parser can reject it.
+          ignoreBOM: true,
+        }).decode(this.#frameBuffer.subarray(0, this.#frameLength));
+        this.#frameBuffer = Buffer.alloc(0);
+        this.#frameLength = 0;
         this.onmessage?.(deserializeMessage(line));
+        offset = newline + 1;
       }
-      if (this.#buffer.length > MAX_FRAME_BYTES)
-        throw new Error(`JADX MCP frame exceeds ${MAX_FRAME_BYTES} bytes`);
     } catch (cause) {
       this.#fail(cause instanceof Error ? cause : new Error(String(cause)));
     }
   };
+  #appendFrame(fragment: Buffer, frameBytes: number): void {
+    if (frameBytes > this.#frameBuffer.length) {
+      const capacity = Math.min(
+        MAX_FRAME_BYTES,
+        Math.max(frameBytes, this.#frameBuffer.length * 2, 1),
+      );
+      const grown = Buffer.allocUnsafe(capacity);
+      this.#frameBuffer.copy(grown, 0, 0, this.#frameLength);
+      this.#frameBuffer = grown;
+    }
+    fragment.copy(this.#frameBuffer, this.#frameLength);
+    this.#frameLength = frameBytes;
+  }
   #fail(error: Error): void {
     this.#failure ??= error.message;
     this.onerror?.(error);

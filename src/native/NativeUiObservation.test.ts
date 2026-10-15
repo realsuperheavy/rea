@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 import { observeNativeUi } from "./NativeUiObservation.js";
-import type { BinaryTarget } from "../domain/binaryTarget.js";
+import type { BinaryTarget } from "../domain/binaryTargetTypes.js";
 
 const target: BinaryTarget = {
   path: "/fixture/App",
@@ -35,26 +35,47 @@ const validPng = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jv4sAAAAASUVORK5CYII=",
   "base64",
 );
+
+/** Screenshot payload as the native helper reports one PNG buffer. */
+const screenshotOf = (bytes: Buffer) => ({
+  mime_type: "image/png",
+  base64: bytes.toString("base64"),
+  sha256: createHash("sha256").update(bytes).digest("hex"),
+  width: bytes.readUInt32BE(16),
+  height: bytes.readUInt32BE(20),
+});
+
+/** Observe the fixture snapshot carrying one screenshot payload. */
+const observeWithScreenshot = (screenshot: Record<string, unknown>) =>
+  observeNativeUi(
+    target,
+    "observe_native_ui",
+    { ...scope, screenshot: true },
+    {
+      environment: {},
+      invoke: async () => ({ ok: true, result: { ...snapshot, screenshot } }),
+    },
+  );
+
+it.each([
+  { offset: 8, value: 12 },
+  { offset: 16, value: 0x8000_0000 },
+  { offset: 20, value: 0x8000_0000 },
+])(
+  "rejects invalid IHDR metadata with a matching digest",
+  async ({ offset, value }) => {
+    const bytes = Buffer.from(validPng);
+    bytes.writeUInt32BE(value, offset);
+    const result = await observeWithScreenshot(screenshotOf(bytes));
+    expect(result.ok).toBe(false);
+  },
+);
 describe("native UI screenshot validation", () => {
   it("rejects malformed or mismatched screenshot bytes from the helper", async () => {
-    const screenshot = {
-      mime_type: "image/png",
-      base64: validPng.toString("base64"),
+    const result = await observeWithScreenshot({
+      ...screenshotOf(validPng),
       sha256: "0".repeat(64),
-      width: 1,
-      height: 1,
-    };
-    const result = await observeNativeUi(
-      target,
-      "observe_native_ui",
-      { ...scope, screenshot: true },
-      {
-        invoke: async () => ({
-          ok: true,
-          result: { ...snapshot, screenshot },
-        }),
-      },
-    );
+    });
     expect(result.ok).toBe(false);
   });
 
@@ -62,54 +83,60 @@ describe("native UI screenshot validation", () => {
     { base64: "%%%=" },
     { base64: Buffer.from("not a PNG").toString("base64") },
     { width: 2 },
-    { sha256: "0".repeat(64) },
   ])(
     "rejects invalid screenshot field variants from the helper",
     async (change) => {
-      const screenshot = {
-        mime_type: "image/png",
-        base64: validPng.toString("base64"),
-        sha256: createHash("sha256").update(validPng).digest("hex"),
-        width: 1,
-        height: 1,
+      const result = await observeWithScreenshot({
+        ...screenshotOf(validPng),
         ...change,
-      };
-      const result = await observeNativeUi(
-        target,
-        "observe_native_ui",
-        { ...scope, screenshot: true },
-        {
-          invoke: async () => ({
-            ok: true,
-            result: { ...snapshot, screenshot },
-          }),
-        },
-      );
+      });
       expect(result.ok).toBe(false);
     },
   );
 
+  it("rejects a PNG whose IHDR type only matches after ASCII folding", async () => {
+    const bytes = Buffer.from(validPng);
+    const type = bytes.subarray(12, 16);
+    type[0] = (type[0] ?? 0) | 0x80;
+    expect(type.toString("ascii")).toBe("IHDR");
+    const result = await observeWithScreenshot(screenshotOf(bytes));
+    expect(result.ok).toBe(false);
+  });
+
   it("accepts a self-consistent PNG screenshot from the helper", async () => {
-    const bytes = validPng;
-    const screenshot = {
-      mime_type: "image/png",
-      base64: bytes.toString("base64"),
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      width: 1,
-      height: 1,
+    const result = await observeWithScreenshot(screenshotOf(validPng));
+    expect(result.ok).toBe(true);
+  });
+
+  it("preserves an unknown AX child count and its truncation gap", async () => {
+    const partial = {
+      ...snapshot,
+      nodes: [
+        {
+          path: [],
+          role: "AXWindow",
+          title: "Fixture",
+          value: null,
+          actions: [],
+          children_count: null,
+        },
+      ],
+      truncated: true,
+      gaps: ["AX child count unavailable at path []: AXError -25204"],
     };
     const result = await observeNativeUi(
       target,
       "observe_native_ui",
-      { ...scope, screenshot: true },
-      {
-        invoke: async () => ({
-          ok: true,
-          result: { ...snapshot, screenshot },
-        }),
-      },
+      { ...scope, accessibility: true },
+      { environment: {}, invoke: async () => ({ ok: true, result: partial }) },
     );
     expect(result.ok).toBe(true);
+    if (result.ok)
+      expect(result.value.initial).toMatchObject({
+        truncated: true,
+        gaps: ["AX child count unavailable at path []: AXError -25204"],
+        nodes: [{ children_count: null }],
+      });
   });
 });
 
@@ -124,7 +151,7 @@ describe("native UI capture selection and budgets", () => {
       target,
       "observe_native_ui",
       { pid: 123, window_id: 456, screenshot: false, accessibility: true },
-      { invoke },
+      { environment: {}, invoke },
     );
     expect(observed.ok).toBe(true);
     const captured = await observeNativeUi(
@@ -137,7 +164,7 @@ describe("native UI capture selection and budgets", () => {
         accessibility: true,
         steps: [{ kind: "click", path: [] }],
       },
-      { invoke },
+      { environment: {}, invoke },
     );
     expect(captured.ok).toBe(true);
     expect(calls).toBe(3);
@@ -160,6 +187,7 @@ describe("native UI capture selection and budgets", () => {
         steps,
       },
       {
+        environment: {},
         invoke: async (parameters) => {
           nodeLimits.push(parameters.max_nodes);
           return { ok: true, result: snapshot };
@@ -191,6 +219,7 @@ describe("native UI capture selection and budgets", () => {
         })),
       },
       {
+        environment: {},
         signal: controller.signal,
         invoke: async () => {
           controller.abort();
@@ -205,6 +234,30 @@ describe("native UI capture selection and budgets", () => {
         outcome: "cancelled",
       });
   });
+  it("reports aggregate output exhaustion after individually valid captures", async () => {
+    const largeSnapshot = {
+      ...snapshot,
+      window: { ...snapshot.window, title: "x".repeat(17 * 1024 * 1024) },
+    };
+    const result = await observeNativeUi(
+      target,
+      "capture_native_ui_scenario",
+      {
+        ...scope,
+        steps: [{ kind: "wait", milliseconds: 0 }],
+      },
+      {
+        environment: {},
+        invoke: async () => ({ ok: true, result: largeSnapshot }),
+      },
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok)
+      expect(result.value.steps[0]).toMatchObject({
+        outcome: "failed",
+        reason: expect.stringContaining("64 MiB output budget"),
+      });
+  });
 });
 
 describe("native UI target and cancellation failures", () => {
@@ -214,6 +267,7 @@ describe("native UI target and cancellation failures", () => {
     "ambiguous-window",
   ])("preserves actionable %s without fallback", async (code) => {
     const result = await observeNativeUi(target, "observe_native_ui", scope, {
+      environment: {},
       invoke: async () => ({
         ok: false,
         code,
@@ -222,6 +276,25 @@ describe("native UI target and cancellation failures", () => {
     });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error.message).toContain(code);
+  });
+  it("preserves the underlying helper failure reason in diagnostics", async () => {
+    const result = await observeNativeUi(target, "observe_native_ui", scope, {
+      environment: {},
+      invoke: async () => {
+        throw new Error(
+          "Native helper returned invalid JSON: Unexpected token",
+        );
+      },
+    });
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.error).toMatchObject({
+      diagnostics: {
+        reason: "Native helper returned invalid JSON: Unexpected token",
+        remediation:
+          "Native helper failed, timed out, or returned malformed capture data; install compatible Xcode command-line tools and inspect local OS permissions",
+      },
+    });
   });
   it("stops on a failed action and returns ordered before/capture-gap evidence", async () => {
     const calls: Readonly<Record<string, unknown>>[] = [];
@@ -236,6 +309,7 @@ describe("native UI target and cancellation failures", () => {
         ],
       },
       {
+        environment: {},
         invoke: async (parameters) => {
           calls.push(parameters);
           return calls.length === 1
@@ -273,6 +347,7 @@ describe("native UI target and cancellation failures", () => {
         ],
       },
       {
+        environment: {},
         signal: controller.signal,
         invoke: async () => {
           calls++;
@@ -285,6 +360,7 @@ describe("native UI target and cancellation failures", () => {
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value.steps[0]?.outcome).toBe("cancelled");
     const replaced = await observeNativeUi(target, "observe_native_ui", scope, {
+      environment: {},
       invoke: async () => ({
         ok: true,
         result: { ...snapshot, window: { ...snapshot.window, pid: 999 } },

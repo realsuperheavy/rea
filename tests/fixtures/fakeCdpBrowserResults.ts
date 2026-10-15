@@ -6,7 +6,7 @@ export const resultFor = (
   port: number,
   options: FakeOptions,
   frameTreeReads: number,
-): Readonly<Record<string, unknown>> => {
+): Readonly<Record<string, unknown>> | undefined => {
   switch (command.method) {
     case "Target.attachToTarget":
       return attachToTargetResult(options);
@@ -24,6 +24,8 @@ export const resultFor = (
       return responseBodyResult(options);
     case "Page.captureScreenshot":
       return screenshotResult();
+    case "Browser.getVersion":
+      return browserVersionResult();
     case "Target.getTargets":
       return { targetInfos: targets(port, options).map(endpointTargetToInfo) };
     case "Storage.getUsageAndQuota":
@@ -37,17 +39,43 @@ export const resultFor = (
     case "IndexedDB.requestDatabase":
       return indexedDbDatabaseResult(command);
     case "IndexedDB.requestData":
-      return indexedDbDataResult();
+      return indexedDbDataResult(options);
     case "CacheStorage.requestCacheNames":
       return cacheStorageResult(options);
     case "CacheStorage.requestEntries":
       return cacheEntriesResult(port);
     case "CacheStorage.requestCachedResponse":
       return cachedResponseResult(options);
-    default:
+    case "Page.enable":
+    case "Page.disable":
+    case "Page.setLifecycleEventsEnabled":
+    case "Network.enable":
+    case "Network.disable":
+    case "Debugger.disable":
+    case "Runtime.enable":
+    case "Runtime.disable":
+    case "Runtime.releaseObjectGroup":
+    case "DOM.enable":
+    case "DOM.disable":
       return {};
+    case "Debugger.enable":
+      return { debuggerId: "fake-debugger" };
+    case "Target.detachFromTarget":
+    case "WebMCP.enable":
+      return {};
+    default:
+      return undefined;
   }
 };
+
+/** Chrome's browser-socket reply shape, mirroring the fake's `/json/version`. */
+const browserVersionResult = () => ({
+  protocolVersion: "1.3",
+  product: "FakeChrome/1.0",
+  revision: "@fake-revision",
+  userAgent: "FakeChrome",
+  jsVersion: "13.0",
+});
 
 const attachToTargetResult = (options: FakeOptions) => ({
   sessionId: options.invalidAttachedSession ? "" : "session-1",
@@ -66,7 +94,9 @@ const frameTreeResult = (
         ? ":"
         : (options.electronFileUrl ?? options.attachedFrameUrl),
     options.extraCollections === true,
-    options.webMcpFrameCount,
+    options.webMcpSameUrlRegistrations === undefined
+      ? options.webMcpFrameCount
+      : "same-url",
   );
 
 const resourceTreeResult = (port: number, options: FakeOptions) =>
@@ -99,7 +129,7 @@ const responseBodyResult = (options: FakeOptions) =>
       };
 
 const screenshotResult = () => ({
-  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PzWvWQAAAABJRU5ErkJggg==",
+  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
 });
 
 const storageUsageResult = () => ({
@@ -154,16 +184,33 @@ const indexedDbDatabaseResult = (command: FakeCdpCommand) => ({
   },
 });
 
-const indexedDbDataResult = () => ({
+const indexedDbDataResult = (options: FakeOptions) => ({
   objectStoreDataEntries: [
     {
-      key: { type: "string", value: "row-1" },
-      primaryKey: { type: "string", value: "row-1" },
+      key: indexedDbKey(options),
+      primaryKey: indexedDbKey(options),
       value: { type: "string", value: "indexed-db-secret" },
     },
   ],
   hasMore: false,
 });
+
+const indexedDbKey = (options: FakeOptions) =>
+  options.indexedDbDateKeys === true
+    ? {
+        type: "object",
+        subtype: "date",
+        className: "Date",
+        description: "Thu Jan 01 1970 00:00:00 GMT+0000",
+        objectId: "owned-date-key",
+        preview: {
+          type: "object",
+          subtype: "date",
+          overflow: false,
+          properties: [],
+        },
+      }
+    : { type: "string", value: "row-1" };
 
 const cacheStorageResult = (options: FakeOptions) => ({
   caches: [
@@ -219,7 +266,7 @@ const frameTree = (
   port: number,
   overrideUrl?: string,
   extraCollections = false,
-  webMcpFrameCount = 0,
+  webMcpFrameCount: number | "same-url" = 0,
 ): Readonly<Record<string, unknown>> => ({
   frameTree: {
     frame: {
@@ -242,14 +289,17 @@ const frameTree = (
             },
           ]
         : []),
-      ...Array.from({ length: webMcpFrameCount }, (_value, index) => ({
-        frame: {
-          id: `webmcp-frame-${String(index)}`,
-          parentId: "frame-main",
-          loaderId: `loader-webmcp-${String(index)}`,
-          url: `http://127.0.0.1:${String(port)}/webmcp-frame/${String(index)}`,
-        },
-      })),
+      ...Array.from(
+        { length: webMcpFrameCount === "same-url" ? 2 : webMcpFrameCount },
+        (_value, index) => ({
+          frame: {
+            id: `webmcp-frame-${String(index)}`,
+            parentId: "frame-main",
+            loaderId: `loader-webmcp-${String(index)}`,
+            url: `http://127.0.0.1:${String(port)}/webmcp-frame/${webMcpFrameCount === "same-url" ? "shared" : String(index)}`,
+          },
+        }),
+      ),
       {
         frame: {
           id: "frame-private",

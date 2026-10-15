@@ -14,11 +14,12 @@ import {
   isHttpUrl,
   numberValue,
   recordValue,
-  stringValue,
+  cdpStringValue,
   type UnknownRecord,
 } from "./CdpCaptureValues.js";
 import { mainFrameUrl } from "./CdpCaptureDocuments.js";
 import { isMainFrameNavigation } from "./CdpCaptureEventHelpers.js";
+import { cdpTargetEventMatches } from "./CdpTargetEvents.js";
 
 interface ObservationContext {
   readonly connection: CdpConnection;
@@ -51,7 +52,7 @@ export const observeCdpSession = async (
     sessionId: context.sessionId,
     signal: context.signal,
     allowedOrigins,
-    delayOperation: "observe_web_session",
+    operation: "observe_web_session",
   });
   const initialUrl = mainFrameUrl(initial) ?? "";
   const mainFrameId = frameId(initial);
@@ -59,8 +60,7 @@ export const observeCdpSession = async (
     throw new BrowserObservationError("inspect_web_page", "protocol_error");
   const capture = new TimelineCapture(allowedOrigins, mainFrameId, initialUrl);
   const removeListener = context.connection.onEvent((event) => {
-    if (observationEventMatches(event, context.sessionId))
-      capture.ingest(event);
+    if (cdpTargetEventMatches(event, context.sessionId)) capture.ingest(event);
   });
   const removeDisconnectListener = context.connection.onDisconnect(() =>
     capture.targetTerminated(),
@@ -106,6 +106,7 @@ export const observeCdpSession = async (
       message: "Browser observation window ended",
       terminal: true,
     });
+    if (capture.scopeExcluded) endReason = "target_left_scope";
     return {
       browser: context.discovery.version,
       target: {
@@ -139,6 +140,7 @@ class TimelineCapture {
   finalUrl: string | null;
   #sequence = 0;
   #pendingReload = false;
+  #scopeExcluded = false;
   #endReason: EndReason | undefined;
   readonly #listeners = new Set<(reason: EndReason) => void>();
 
@@ -152,7 +154,7 @@ class TimelineCapture {
   }
 
   ingest(event: CdpEvent): void {
-    if (this.#endReason !== undefined) return;
+    if (this.#endReason !== undefined || this.#scopeExcluded) return;
     const params = recordValue(event.params);
     if (params === undefined) return;
     switch (event.method) {
@@ -207,8 +209,22 @@ class TimelineCapture {
   }
 
   setFinalUrl(rawUrl: string): void {
+    if (this.#scopeExcluded) return;
     const destination = scopedUrl(rawUrl, this.allowedOrigins);
     this.finalUrl = destination.scope === "approved" ? destination.url : null;
+  }
+
+  get scopeExcluded(): boolean {
+    return this.#scopeExcluded;
+  }
+
+  excludeTargetScope(
+    reason: "invalid_protocol_value" | "out_of_target_scope",
+  ): void {
+    if (this.#scopeExcluded) return;
+    this.#scopeExcluded = true;
+    this.finalUrl = null;
+    this.completeness.exclude("timeline", reason);
   }
 
   #navigationRequested(event: CdpEvent, params: UnknownRecord): void {
@@ -218,7 +234,7 @@ class TimelineCapture {
     this.#add({
       type: "navigation_requested",
       params,
-      rawUrl: stringValue(params.url) ?? null,
+      rawUrl: cdpStringValue(params.url) ?? null,
       requestId: null,
       detail: reason,
     });
@@ -227,7 +243,7 @@ class TimelineCapture {
   #navigationCommitted(event: CdpEvent, params: UnknownRecord): void {
     const frame = recordValue(params.frame);
     if (!isMainFrameNavigation(event, this.mainFrameId)) return;
-    const rawUrl = stringValue(frame?.url);
+    const rawUrl = cdpStringValue(frame?.url);
     const destination = scopedUrl(rawUrl, this.allowedOrigins);
     this.#add({
       type: this.#pendingReload ? "same_origin_reload" : "navigation_committed",
@@ -239,15 +255,14 @@ class TimelineCapture {
     this.#pendingReload = false;
     if (destination.scope === "approved") this.finalUrl = destination.url;
     else {
-      this.finalUrl = null;
-      this.completeness.exclude("timeline", "out_of_target_scope");
+      this.excludeTargetScope("out_of_target_scope");
       this.end("target_left_scope");
     }
   }
 
   #sameDocument(event: CdpEvent, params: UnknownRecord): void {
     if (!isMainFrameNavigation(event, this.mainFrameId)) return;
-    const rawUrl = stringValue(params.url);
+    const rawUrl = cdpStringValue(params.url);
     const destination = scopedUrl(rawUrl, this.allowedOrigins);
     this.#add({
       type: "same_document_navigation",
@@ -258,50 +273,49 @@ class TimelineCapture {
     });
     if (destination.scope === "approved") this.finalUrl = destination.url;
     else {
-      this.finalUrl = null;
-      this.completeness.exclude("timeline", "out_of_target_scope");
+      this.excludeTargetScope("out_of_target_scope");
       this.end("target_left_scope");
     }
   }
 
   #redirect(params: UnknownRecord): void {
-    const resourceType = stringValue(params.type);
+    const resourceType = cdpStringValue(params.type);
     if (resourceType !== undefined && resourceType !== "Document") return;
     if (
-      stringValue(params.frameId) !== this.mainFrameId ||
+      cdpStringValue(params.frameId) !== this.mainFrameId ||
       recordValue(params.redirectResponse) === undefined
     )
       return;
     const request = recordValue(params.request);
-    const rawUrl = stringValue(request?.url);
+    const rawUrl = cdpStringValue(request?.url);
     const destination = scopedUrl(rawUrl, this.allowedOrigins);
     this.#add({
       type: "redirect",
       params,
       rawUrl: rawUrl ?? null,
-      requestId: stringValue(params.requestId) ?? null,
+      requestId: cdpStringValue(params.requestId) ?? null,
       detail: null,
     });
     if (destination.scope !== "approved") {
-      this.completeness.exclude("timeline", "out_of_target_scope");
+      this.excludeTargetScope("out_of_target_scope");
       this.end("target_left_scope");
     }
   }
 
   #loadingFailed(params: UnknownRecord): void {
-    const frame = stringValue(params.frameId);
+    const frame = cdpStringValue(params.frameId);
     if (frame !== undefined && frame !== this.mainFrameId) return;
     this.#add({
       type: "load_failed",
       params,
       rawUrl: null,
-      requestId: stringValue(params.requestId) ?? null,
+      requestId: cdpStringValue(params.requestId) ?? null,
       detail: safeNetworkError(params.errorText),
     });
   }
 
   #lifecycle(params: UnknownRecord): void {
-    if (stringValue(params.frameId) !== this.mainFrameId) return;
+    if (cdpStringValue(params.frameId) !== this.mainFrameId) return;
     this.#add({
       type: "lifecycle",
       params,
@@ -335,18 +349,6 @@ class TimelineCapture {
     });
   }
 }
-
-const observationEventMatches = (
-  event: CdpEvent,
-  sessionId: string | undefined,
-): boolean => {
-  if (event.method !== "Target.detachedFromTarget")
-    return event.sessionId === sessionId;
-  return (
-    sessionId !== undefined &&
-    stringValue(recordValue(event.params)?.sessionId) === sessionId
-  );
-};
 
 const waitForWindow = async (
   durationMs: number,
@@ -382,12 +384,14 @@ const captureFinalUrl = async (
   capture: TimelineCapture,
   allowedOrigins: ReadonlySet<string>,
 ): Promise<EndReason> => {
+  if (capture.scopeExcluded) return "target_left_scope";
   const result = await context.connection.send(
     "Page.getFrameTree",
     {},
     context.sessionId,
     context.signal,
   );
+  if (capture.scopeExcluded) return "target_left_scope";
   const url = mainFrameUrl(result);
   if (
     url !== undefined &&
@@ -396,16 +400,14 @@ const captureFinalUrl = async (
     capture.setFinalUrl(url);
     return "window_elapsed";
   }
-  capture.finalUrl = null;
-  capture.completeness.exclude(
-    "timeline",
+  capture.excludeTargetScope(
     url === undefined ? "invalid_protocol_value" : "out_of_target_scope",
   );
   return "target_left_scope";
 };
 
 const frameId = (result: unknown): string | undefined =>
-  stringValue(
+  cdpStringValue(
     recordValue(recordValue(recordValue(result)?.frameTree)?.frame)?.id,
   );
 
@@ -423,17 +425,18 @@ const scopedUrl = (
     : { url: null, scope: "unsupported" };
 };
 
-const boundedId = (value: unknown): string | null => stringValue(value) ?? null;
+const boundedId = (value: unknown): string | null =>
+  cdpStringValue(value) ?? null;
 
 const safeDetail = (value: unknown): string | null => {
-  const detail = stringValue(value)?.toLowerCase();
+  const detail = cdpStringValue(value)?.toLowerCase();
   return detail !== undefined && /^[a-z0-9_.:-]{1,100}$/u.test(detail)
     ? detail
     : null;
 };
 
 const safeNetworkError = (value: unknown): string | null => {
-  const error = stringValue(value);
+  const error = cdpStringValue(value);
   return error !== undefined && /^net::ERR_[A-Z0-9_]{1,100}$/u.test(error)
     ? error
     : null;

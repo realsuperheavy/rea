@@ -56,7 +56,7 @@ it("does not require duplicate origin scope declarations", () => {
   const scenario = browserScenarioSchema.parse({
     browser: {
       mode: "launch",
-      executable_path: "chrome",
+      executable_path: "/opt/chromium/chrome",
     },
     start_url: { url: "https://app.example.test/" },
     actions: [
@@ -85,6 +85,34 @@ it("does not require duplicate origin scope declarations", () => {
   expect(scenario.storage.local_storage[0]?.origin).toBe(
     "https://storage.example.test",
   );
+});
+
+it("accepts caller-selected safe capture limits and rejects invalid bounds", () => {
+  const base = {
+    browser: { mode: "launch", executable_path: "/opt/chromium" },
+    start_url: { url: "https://example.test/" },
+    actions: [{ step_id: "wait", action: "wait_for_timeout", duration_ms: 1 }],
+  };
+  expect(
+    browserScenarioSchema.parse({
+      ...base,
+      capture: {
+        limits: { max_total_event_allocation_bytes: 32 * 1024 * 1024 },
+      },
+    }).capture.limits,
+  ).toMatchObject({
+    max_events: 10_000,
+    max_event_allocation_bytes: 4 * 1024 * 1024,
+    max_total_event_allocation_bytes: 32 * 1024 * 1024,
+    max_network_body_bytes: 64 * 1024,
+  });
+  for (const invalid of [0, Number.MAX_SAFE_INTEGER + 1, Number.NaN])
+    expect(
+      browserScenarioSchema.safeParse({
+        ...base,
+        capture: { limits: { max_events: invalid } },
+      }).success,
+    ).toBe(false);
 });
 
 it("accepts complete browser inputs beyond former string length caps", () => {

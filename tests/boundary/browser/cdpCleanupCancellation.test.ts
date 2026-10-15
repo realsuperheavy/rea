@@ -7,7 +7,7 @@ import { expect, it, onTestFinished, vi } from "vitest";
 import { CdpBrowserProvider } from "../../../src/browser/CdpBrowserProvider.js";
 import { CdpElectronProvider } from "../../../src/browser/CdpElectronProvider.js";
 import { observeWebSessionInputSchema } from "../../../src/domain/browserSession.js";
-import { inspectElectronPageInputSchema } from "../../../src/domain/electronObservation.js";
+import { inspectElectronPageInputSchema } from "../../../src/domain/javascript/electronObservation.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { startFakeCdpBrowser } from "../../fixtures/fakeCdpBrowser.js";
 
@@ -47,6 +47,7 @@ it.each(["Page.disable", "Target.detachFromTarget"])(
     expect(methods).toContain("Target.detachFromTarget");
     expect(methods).not.toContain("Target.closeTarget");
     expect(methods).not.toContain("Browser.close");
+    await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
   },
 );
 
@@ -72,10 +73,21 @@ it("releases cleanup when cancellation arrives after capture completes", async (
   });
   controller.abort();
   const result = await pending;
-  expect(result.ok).toBe(true);
+  expect(result).toMatchObject({
+    ok: false,
+    error: {
+      _tag: "AnalysisCancelledError",
+      operation: "observe_web_session",
+    },
+  });
   expect(browser.commands.map(({ method }) => method)).toContain(
     "Target.detachFromTarget",
   );
+  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  const methods = browser.commands.map(({ method }) => method);
+  expect(methods).not.toContain("Target.closeTarget");
+  expect(methods).not.toContain("Browser.close");
+  expect((await fetch(`${browser.endpoint}/json/version`)).ok).toBe(true);
 });
 
 it("closes an Electron inspection session when cleanup is cancelled", async () => {
@@ -122,11 +134,11 @@ it("closes an Electron inspection session when cleanup is cancelled", async () =
       operation: "inspect_electron_page",
     },
   });
-  expect(browser.commands.map(({ method }) => method)).toContain(
-    "Page.disable",
-  );
   const methods = browser.commands.map(({ method }) => method);
+  expect(methods).not.toContain("Page.disable");
   expect(methods).toContain("Target.detachFromTarget");
   expect(methods).not.toContain("Target.closeTarget");
   expect(methods).not.toContain("Browser.close");
+  await vi.waitFor(() => expect(browser.activeConnectionCount()).toBe(0));
+  expect((await fetch(`${browser.endpoint}/json/version`)).ok).toBe(true);
 });

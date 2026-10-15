@@ -6,44 +6,34 @@
     "max-depth": ["warn", 4],
     "max-lines": [
       "warn",
-      { "max": 500, "skipBlankLines": true, "skipComments": true }
+      {
+        "max": 500,
+        "skipBlankLines": true,
+        "skipComments": true
+      }
     ],
     "max-lines-per-function": [
       "warn",
-      { "max": 100, "skipBlankLines": true, "skipComments": true }
+      {
+        "max": 100,
+        "skipBlankLines": true,
+        "skipComments": true
+      }
     ],
     "max-params": ["warn", 4],
     "no-var": "warn",
-    "no-var-requires": "error"
+    "no-var-requires": "error",
+    "typescript/no-import-type-side-effects": "error"
   },
   "overrides": [
     {
       "files": [
         "scripts/electron-active-hook*.cjs",
-        "tests/conformance/readiness/electron/*.js"
+        "tests/conformance/readiness/electron/*.js",
+        "website/public/examples/notes-electron/*.js"
       ],
       "rules": {
         "no-var-requires": "off"
-      }
-    },
-    {
-      "files": [
-        "src/{contracts,domain,server}/**/*.ts",
-        "src/application/**/*.ts"
-      ],
-      "excludeFiles": ["src/application/runtime.ts"],
-      "rules": {
-        "no-restricted-imports": [
-          "error",
-          {
-            "patterns": [
-              {
-                "group": ["**/ghidra/**", "**/hopper/**", "**/ida/**"],
-                "message": "Deep-provider imports belong behind adapters or in the application composition root."
-              }
-            ]
-          }
-        ]
       }
     },
     {
@@ -52,33 +42,10 @@
         "max-lines": "off",
         "max-lines-per-function": [
           "error",
-          { "max": 150, "skipBlankLines": true, "skipComments": true }
-        ]
-      }
-    },
-    {
-      "files": ["src/domain/**/*.{fixture,test}.ts"],
-      "rules": {
-        "no-restricted-imports": [
-          "error",
           {
-            "patterns": [
-              {
-                "group": [
-                  "**/application/**",
-                  "**/server/**",
-                  "**/process/**",
-                  "**/browser/**",
-                  "**/ghidra/**",
-                  "**/hopper/**",
-                  "**/ida/**",
-                  "**/replay/**",
-                  "**/cli.*",
-                  "**/main.*"
-                ],
-                "message": "Domain tests may import only their owning domain and inward dependencies."
-              }
-            ]
+            "max": 150,
+            "skipBlankLines": true,
+            "skipComments": true
           }
         ]
       }

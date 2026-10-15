@@ -1,13 +1,29 @@
 import { createHash } from "node:crypto";
 
-/** Hash canonicalize-compatible JSON without assembling an aggregate string. */
+/**
+ * Streaming SHA-256 over canonical JSON. Hashing owner (avoids assembling
+ * aggregate strings); `comparisonSemantics.canonicalJson` (canonicalize lib)
+ * is the string-comparison owner. JSON object keys follow RFC 8785's UTF-16
+ * code-unit order in both; entity-list ordering is a separate concern.
+ */
 export const digestCanonicalValue = (
   value: unknown,
   context = "Comparison",
 ): string => {
   const hash = createHash("sha256");
-  const encoded = emitCanonical(value, (part) => hash.update(part), new Set());
+  // Batch small emitted parts to cut hash.update crossings.
+  // Flush cuts only at part boundaries, so the hashed byte stream is unchanged.
+  let buffered = "";
+  const emit = (part: string): void => {
+    buffered += part;
+    if (buffered.length >= 8192) {
+      hash.update(buffered);
+      buffered = "";
+    }
+  };
+  const encoded = emitCanonical(value, emit, new Set());
   if (!encoded) throw new TypeError(`${context} could not canonicalize data`);
+  if (buffered) hash.update(buffered);
   return hash.digest("hex");
 };
 
@@ -53,6 +69,7 @@ const emitCanonical = (
     } else {
       emit("{");
       let first = true;
+      // Match canonicalize/RFC 8785, including supplementary-plane keys.
       for (const key of Object.keys(value).sort()) {
         if (
           Reflect.get(value, key) === undefined ||

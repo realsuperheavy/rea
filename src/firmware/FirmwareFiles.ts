@@ -3,12 +3,12 @@ import { constants, createReadStream, createWriteStream } from "node:fs";
 import {
   chmod,
   lstat,
+  opendir,
   open,
-  readdir,
   readlink,
   realpath,
 } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
@@ -16,9 +16,11 @@ import {
   AnalysisInputError,
   AnalysisOutputError,
 } from "../domain/analysisErrorCore.js";
-import type { FirmwareRequest } from "../domain/firmwareAnalysis.js";
+import type { FirmwareRequest } from "../domain/firmware/firmwareAnalysis.js";
+import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
 import { FIRMWARE_LIMITS } from "./FirmwareRelease.js";
+import { compareUnicodeCodePoints } from "../domain/unicodeCodePointOrder.js";
 
 /** One regular file or unpublished filesystem entry in a private extraction. */
 export interface FirmwareEntry {
@@ -28,6 +30,13 @@ export interface FirmwareEntry {
   readonly kind: "file" | "symlink" | "special";
   readonly linkTarget: string | null;
 }
+
+const throwIfFirmwareInventoryCancelled = (
+  signal: AbortSignal | undefined,
+  operation: string,
+): void => {
+  if (signal?.aborted === true) throw new AnalysisCancelledError(operation);
+};
 
 /** Hash a regular tool or extracted file without retaining its bytes in memory. */
 export const hashFirmwareFile = async (
@@ -55,7 +64,7 @@ export const snapshotFirmware = async (
   root: string,
   signal: AbortSignal,
 ) => {
-  const sourcePath = resolve(request.input.path);
+  const sourcePath = absoluteCallerPath(request.input.path);
   const source = await realpath(sourcePath);
   const handle = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
   const fullPath = join(root, "firmware.bin");
@@ -153,7 +162,11 @@ export const readFirmwareReport = async (
         `Report exceeded ${FIRMWARE_LIMITS.reportBytes} bytes`,
       );
     try {
-      const value: unknown = JSON.parse(bytes.toString("utf8"));
+      const value: unknown = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+          bytes,
+        ),
+      );
       return value;
     } catch (cause: unknown) {
       throw new AnalysisOutputError(
@@ -180,7 +193,7 @@ export const inventoryFirmwareOutput = async (
   let bytes = 0;
   let count = 0;
   while (pending.length > 0) {
-    if (signal?.aborted === true) throw new AnalysisCancelledError(operation);
+    throwIfFirmwareInventoryCancelled(signal, operation);
     const directory = pending.pop();
     if (directory === undefined) break;
     const directoryStat = await lstat(directory).catch((cause: unknown) => {
@@ -194,18 +207,24 @@ export const inventoryFirmwareOutput = async (
       directoryStat.isSymbolicLink()
     )
       continue;
-    const names = await readdir(directory).catch((cause: unknown) => {
+    const handle = await opendir(directory).catch((cause: unknown) => {
       if (cause instanceof Error && "code" in cause && cause.code === "ENOENT")
-        return [];
+        return undefined;
       throw cause;
     });
-    for (const name of names.sort()) {
+    if (handle === undefined) continue;
+    const names: string[] = [];
+    for await (const entry of handle) {
+      throwIfFirmwareInventoryCancelled(signal, operation);
       count++;
       if (count > maxEntries)
         throw new AnalysisOutputError(
           operation,
           `Staging entry budget exceeded (${maxEntries})`,
         );
+      names.push(entry.name);
+    }
+    for (const name of names.sort()) {
       const path = join(directory, name);
       const stat = await lstat(path).catch((cause: unknown) => {
         if (
@@ -240,7 +259,9 @@ export const inventoryFirmwareOutput = async (
       });
     }
   }
-  return entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  return entries.sort((a, b) =>
+    compareUnicodeCodePoints(a.relativePath, b.relativePath),
+  );
 };
 
 /** Bind producer paths to the selected input or private extraction tree. */
